@@ -1,3 +1,13 @@
+# Datasets (large, do not commit)
+alfred/
+coco/
+
+# Local development utilities
+tools/
+
+# Third-party repos cloned locally (reference via README)
+puzzlebot_ros_official/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

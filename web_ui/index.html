@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PuzzleBot Navigation Control</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  background: #1a1a1a; color: #ececec;
+  height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* ── Header ── */
+header {
+  background: #242424; border-bottom: 1px solid #333;
+  padding: 11px 18px; display: flex; align-items: center;
+  gap: 10px; flex-shrink: 0;
+}
+.dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #3a3a3a; flex-shrink: 0; transition: background 0.3s;
+}
+.dot.connected  { background: #4ade80; }
+.dot.connecting { background: #facc15; animation: pulse 1s infinite; }
+.dot.error      { background: #f87171; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+header h1 { font-size: 0.95rem; font-weight: 600; color: #e0e0e0; }
+#conn-label { font-size: 0.72rem; color: #555; }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 7px; }
+#ros-url-input {
+  background: #2c2c2c; border: 1px solid #3a3a3a; border-radius: 5px;
+  color: #888; padding: 3px 8px; font-size: 0.68rem; width: 155px; outline: none;
+}
+#conn-btn {
+  background: #2c2c2c; border: 1px solid #3a3a3a; border-radius: 5px;
+  color: #888; padding: 3px 10px; font-size: 0.68rem; cursor: pointer;
+}
+#conn-btn:hover { background: #383838; color: #bbb; }
+
+/* ── Layout ── */
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 370px;
+  overflow: hidden;
+}
+
+/* ── Camera panel (left side — two stacked views) ── */
+.cam-panel {
+  display: flex; flex-direction: column;
+  background: #0f0f0f; border-right: 1px solid #2a2a2a; overflow: hidden;
+}
+.cam-section {
+  flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+}
+.cam-section + .cam-section { border-top: 1px solid #1e1e1e; }
+.cam-title {
+  padding: 5px 14px; font-size: 0.62rem; color: #383838;
+  letter-spacing: .06em; text-transform: uppercase;
+  border-bottom: 1px solid #181818; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.traj-reset {
+  background: none; border: 1px solid #2a2a2a; border-radius: 4px;
+  color: #333; font-size: 0.60rem; padding: 1px 7px; cursor: pointer;
+  text-transform: none; letter-spacing: 0;
+}
+.traj-reset:hover { border-color: #444; color: #666; }
+.cam-view {
+  flex: 1; display: flex; align-items: center;
+  justify-content: center; overflow: hidden; position: relative;
+}
+.cam-canvas { max-width: 100%; max-height: 100%; display: none; }
+.cam-ph {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 8px; color: #1e1e1e; user-select: none; position: absolute;
+}
+.cam-ph svg { opacity: 0.4; }
+.cam-ph span { font-size: 0.72rem; color: #282828; }
+
+/* ── Chat panel ── */
+.chat-panel {
+  display: flex; flex-direction: column;
+  background: #1a1a1a; overflow: hidden;
+}
+.messages {
+  flex: 1; overflow-y: auto; padding: 16px 14px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.messages::-webkit-scrollbar { width: 3px; }
+.messages::-webkit-scrollbar-thumb { background: #2e2e2e; border-radius: 2px; }
+
+/* Message types */
+.msg-sys {
+  text-align: center; font-size: 0.68rem;
+  color: #3e3e3e; font-style: italic; padding: 1px 0;
+}
+.msg-row { display: flex; flex-direction: column; max-width: 88%; }
+.msg-row.user  { align-self: flex-end;   align-items: flex-end; }
+.msg-row.robot { align-self: flex-start; align-items: flex-start; }
+.msg-who { font-size: 0.62rem; color: #444; margin-bottom: 3px; padding: 0 4px; }
+.msg-bubble {
+  padding: 10px 14px; border-radius: 14px;
+  font-size: 0.84rem; line-height: 1.55; word-break: break-word;
+}
+.msg-row.user  .msg-bubble {
+  background: #1c4ed8; color: #e8f0ff; border-bottom-right-radius: 3px;
+}
+.msg-row.robot .msg-bubble {
+  background: #242424; color: #c8c8c8;
+  border: 1px solid #2e2e2e; border-bottom-left-radius: 3px;
+}
+
+/* Typing indicator */
+.typing-wrap { display: flex; flex-direction: column; gap: 4px; }
+.typing {
+  display: flex; gap: 5px; align-items: center;
+  padding: 10px 14px; background: #242424;
+  border: 1px solid #2e2e2e; border-radius: 14px;
+  border-bottom-left-radius: 3px; width: fit-content;
+}
+.typing span {
+  width: 6px; height: 6px; background: #555;
+  border-radius: 50%; animation: bounce 1.3s infinite;
+}
+.typing span:nth-child(2) { animation-delay: .18s; }
+.typing span:nth-child(3) { animation-delay: .36s; }
+@keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-5px)} }
+.typing-label { font-size: 0.67rem; color: #3e3e3e; padding: 0 4px; }
+
+/* ── Input area ── */
+.input-area {
+  border-top: 1px solid #242424; padding: 11px 12px 13px;
+  background: #1a1a1a; flex-shrink: 0;
+}
+.quick-btns { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 9px; }
+.qbtn {
+  background: #222; border: 1px solid #2e2e2e; border-radius: 20px;
+  color: #666; padding: 3px 11px; font-size: 0.67rem;
+  cursor: pointer; transition: all .15s;
+}
+.qbtn:hover { background: #2e2e2e; color: #aaa; border-color: #3a3a3a; }
+.input-row {
+  display: flex; align-items: flex-end; gap: 8px;
+  background: #222; border: 1px solid #2e2e2e;
+  border-radius: 14px; padding: 9px 10px 9px 16px;
+  transition: border-color .2s;
+}
+.input-row:focus-within { border-color: #2563eb; }
+#cmd-input {
+  flex: 1; background: transparent; border: none;
+  color: #e0e0e0; font-size: 0.88rem; outline: none;
+  resize: none; min-height: 22px; max-height: 110px;
+  line-height: 1.5; font-family: inherit;
+}
+#cmd-input::placeholder { color: #383838; }
+#send-btn {
+  background: #1d4ed8; border: none; border-radius: 9px;
+  color: #fff; width: 35px; height: 35px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s; flex-shrink: 0;
+}
+#send-btn:hover:not(:disabled) { background: #2563eb; }
+#send-btn:disabled { background: #222; color: #2e2e2e; cursor: not-allowed; }
+#send-btn svg { width: 15px; height: 15px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="conn-dot"></div>
+  <h1>PuzzleBot Navigation Control</h1>
+  <span id="conn-label">Disconnected</span>
+  <div class="header-right">
+    <input id="ros-url-input" type="text" value="ws://localhost:9090" />
+    <button id="conn-btn" onclick="toggleConnect()">Connect</button>
+  </div>
+</header>
+
+<main>
+  <!-- Two stacked camera views -->
+  <div class="cam-panel">
+
+    <!-- Top: odometry trajectory map -->
+    <div class="cam-section">
+      <div class="cam-title">
+        <span>Trajectory · /odom</span>
+        <button class="traj-reset" onclick="resetTraj()">Reset</button>
+      </div>
+      <div class="cam-view">
+        <div class="cam-ph" id="ph-overview">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.2">
+            <polyline points="3 17 8 12 13 15 21 7"/>
+            <line x1="3" y1="21" x2="21" y2="21"/>
+          </svg>
+          <span>Waiting for odometry…</span>
+        </div>
+        <canvas class="cam-canvas" id="cv-overview"></canvas>
+      </div>
+    </div>
+
+    <!-- Bottom: robot first-person camera -->
+    <div class="cam-section">
+      <div class="cam-title">Robot Camera · /video_source/raw</div>
+      <div class="cam-view">
+        <div class="cam-ph" id="ph-robot">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.2">
+            <rect x="2" y="7" width="20" height="14" rx="2"/>
+            <path d="M16 3l-4 4-4-4"/>
+            <circle cx="12" cy="14" r="3"/>
+          </svg>
+          <span>Waiting for camera feed…</span>
+        </div>
+        <canvas class="cam-canvas" id="cv-robot"></canvas>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Chat panel -->
+  <div class="chat-panel">
+    <div class="messages" id="messages"></div>
+    <div class="input-area">
+      <div class="quick-btns">
+        <button class="qbtn" onclick="fill('Navigate to the red box')">→ red box</button>
+        <button class="qbtn" onclick="fill('Go to the ArUco marker')">→ aruco</button>
+        <button class="qbtn" onclick="fill('Find the blue chair')">→ blue chair</button>
+        <button class="qbtn" onclick="fill('Move forward')">forward</button>
+        <button class="qbtn" onclick="fill('Turn left')">turn left</button>
+        <button class="qbtn" onclick="fill('Stop')">stop</button>
+      </div>
+      <div class="input-row">
+        <textarea id="cmd-input" rows="1"
+          placeholder="Type a navigation command, e.g. Navigate to the red box"
+          onkeydown="onKey(event)" oninput="autoResize(this)"></textarea>
+        <button id="send-btn" onclick="sendCmd()" disabled title="Send (Enter)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const ROSLIB_CDN = 'https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js';
+let ros = null, cmdPub = null;
+let autoRetry = 0;
+const MAX_RETRY = 12, RETRY_MS = 3000;
+let typingRow = null;
+let lastStatusKey = '';
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  sysMsg('Page loaded — waiting for rosbridge to start…');
+  setTimeout(() => loadRoslib(connect), 3000);
+});
+
+function loadRoslib(cb) {
+  if (window.ROSLIB) { cb(); return; }
+  const s = document.createElement('script');
+  s.src = ROSLIB_CDN;
+  s.onload = cb;
+  s.onerror = () => sysMsg('Failed to load roslibjs — check network.');
+  document.head.appendChild(s);
+}
+
+// ── Connection ─────────────────────────────────────────────────────────────────
+function toggleConnect() {
+  if (ros && ros.isConnected) { autoRetry = MAX_RETRY; ros.close(); }
+  else { autoRetry = 0; loadRoslib(connect); }
+}
+
+function connect() {
+  const url = document.getElementById('ros-url-input').value.trim();
+  ros = new ROSLIB.Ros({ url });
+
+  ros.on('connection', () => {
+    autoRetry = MAX_RETRY;
+    setDot('connected', 'Connected');
+    document.getElementById('conn-btn').textContent = 'Disconnect';
+    document.getElementById('send-btn').disabled = false;
+    sysMsg('Connected to rosbridge @ ' + url);
+    setupTopics();
+  });
+
+  ros.on('error', () => {
+    setDot('error', 'Error');
+    if (autoRetry < MAX_RETRY) {
+      autoRetry++;
+      sysMsg('rosbridge not ready — retrying (' + autoRetry + '/' + MAX_RETRY + ')…');
+      setTimeout(() => loadRoslib(connect), RETRY_MS);
+    } else {
+      sysMsg('Cannot connect. Is rosbridge running on ' +
+        document.getElementById('ros-url-input').value + '?');
+    }
+  });
+
+  ros.on('close', () => {
+    setDot('', 'Disconnected');
+    document.getElementById('conn-btn').textContent = 'Connect';
+    document.getElementById('send-btn').disabled = true;
+    sysMsg('Disconnected from rosbridge.');
+  });
+}
+
+function setupTopics() {
+  cmdPub = new ROSLIB.Topic({
+    ros, name: '/llm_command', messageType: 'std_msgs/String'
+  });
+
+  new ROSLIB.Topic({
+    ros, name: '/puzzlebot/status', messageType: 'std_msgs/String'
+  }).subscribe(msg => handleStatus(msg.data));
+
+  // Subscribe to each camera topic once, after detecting its actual type.
+  // Never subscribe twice to the same topic with different types — rosbridge
+  // rejects the second subscription and can break both callbacks.
+  subscribeCam('/video_source/raw', 'cv-robot', 'ph-robot');
+  setupOdom();
+}
+
+function subscribeCam(topicName, canvasId, phId) {
+  ros.getTopicType(topicName, function(type) {
+    const msgType = (type && type !== '') ? type : 'sensor_msgs/Image';
+    new ROSLIB.Topic({
+      ros, name: topicName, messageType: msgType, throttle_rate: 200
+    }).subscribe(function(msg) { renderCam(msg, canvasId, phId); });
+  });
+}
+
+// ── Camera rendering ───────────────────────────────────────────────────────────
+function renderCam(msg, canvasId, phId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  if (msg.format !== undefined) {
+    // sensor_msgs/CompressedImage — JPEG blob
+    const img = new Image();
+    img.onload = function() {
+      canvas.width  = img.width;
+      canvas.height = img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      revealCanvas(canvasId, phId);
+    };
+    img.src = 'data:image/jpeg;base64,' + msg.data;
+
+  } else if (msg.width) {
+    // sensor_msgs/Image — raw pixel bytes (base64 encoded by rosbridge)
+    canvas.width  = msg.width;
+    canvas.height = msg.height;
+    const ctx = canvas.getContext('2d');
+
+    const binary  = atob(msg.data);
+    const bytes   = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+    const imgData  = ctx.createImageData(msg.width, msg.height);
+    const enc      = msg.encoding || 'rgb8';
+    const channels = (enc === 'rgba8' || enc === 'bgra8') ? 4 : 3;
+    const isBGR    = enc.startsWith('bgr');
+
+    for (let i = 0; i < msg.width * msg.height; i++) {
+      const s = i * channels, d = i * 4;
+      imgData.data[d]   = isBGR ? bytes[s + 2] : bytes[s];
+      imgData.data[d+1] = bytes[s + 1];
+      imgData.data[d+2] = isBGR ? bytes[s]     : bytes[s + 2];
+      imgData.data[d+3] = 255;
+    }
+    ctx.putImageData(imgData, 0, 0);
+    revealCanvas(canvasId, phId);
+  }
+}
+
+function revealCanvas(canvasId, phId) {
+  document.getElementById(canvasId).style.display = 'block';
+  const ph = document.getElementById(phId);
+  if (ph) ph.style.display = 'none';
+}
+
+// ── Status → chat ──────────────────────────────────────────────────────────────
+function handleStatus(raw) {
+  if (raw.startsWith('ARRIVED')) {
+    robotMsg('Target reached. I have arrived at the destination.');
+    return;
+  }
+
+  const key = raw.split(':')[0];
+
+  if (raw.startsWith('IDLE') || raw.startsWith('LOADING')) {
+    dropTyping();
+    if (lastStatusKey !== key) sysMsg(fmtStatus(raw));
+    lastStatusKey = key;
+    return;
+  }
+  if (raw.startsWith('ERROR')) {
+    dropTyping();
+    robotMsg('Error: ' + fmtStatus(raw));
+    lastStatusKey = key;
+    return;
+  }
+  // PROCESSING / NAVIGATING — update typing label in-place
+  ensureTyping();
+  setTypingLabel(fmtStatus(raw));
+  lastStatusKey = key;
+}
+
+function fmtStatus(s) {
+  if (s.startsWith('LOADING'))              return 'Loading VLM model, please wait…';
+  if (s.startsWith('IDLE'))                 return 'Ready — waiting for command';
+  if (s.startsWith('PROCESSING'))           return 'Understanding command…';
+  if (s.includes('Waiting for camera'))     return 'Waiting for camera feed…';
+  if (s.includes('Loading VLM'))            return 'Loading VLM model…';
+  if (s.includes('detected'))              return 'Target detected — moving toward it…';
+  if (s.startsWith('NAVIGATING: Heading')) {
+    const m = s.match(/Heading to "(.+)"/);
+    return m ? 'Navigating to: ' + m[1] : 'Navigating…';
+  }
+  if (s.startsWith('NAVIGATING'))           return 'Searching for target — robot rotating…';
+  if (s.startsWith('ERROR'))                return s.replace(/^ERROR:\s*/, '');
+  return s;
+}
+
+// ── Odometry trajectory ────────────────────────────────────────────────────────
+let trajPoints  = [];     // [{x, y, yaw}, ...]  relative to origin
+let trajOrigin  = null;   // first received pose becomes (0,0)
+let trajScale   = 80;     // px per metre — shrinks automatically
+const TRAJ_MAX  = 2000;   // keep last N points
+
+function setupOdom() {
+  const canvas = document.getElementById('cv-overview');
+  const ph     = document.getElementById('ph-overview');
+  // Size canvas to its container
+  const parent = canvas.parentElement;
+  canvas.width  = parent.clientWidth  || 400;
+  canvas.height = parent.clientHeight || 280;
+  canvas.style.display = 'block';
+  if (ph) ph.style.display = 'none';
+  drawTraj();
+
+  new ROSLIB.Topic({
+    ros, name: '/odom', messageType: 'nav_msgs/Odometry'
+  }).subscribe(msg => {
+    const p = msg.pose.pose.position;
+    const q = msg.pose.pose.orientation;
+    // Quaternion → yaw
+    const yaw = Math.atan2(
+      2 * (q.w * q.z + q.x * q.y),
+      1 - 2 * (q.y * q.y + q.z * q.z));
+
+    if (!trajOrigin) trajOrigin = { x: p.x, y: p.y };
+
+    trajPoints.push({ x: p.x - trajOrigin.x, y: p.y - trajOrigin.y, yaw });
+    if (trajPoints.length > TRAJ_MAX) trajPoints.shift();
+
+    // Auto-scale so all points stay inside 80% of the shorter axis
+    const maxR   = trajPoints.reduce((m, pt) => Math.max(m, Math.hypot(pt.x, pt.y)), 0);
+    const halfMin = Math.min(canvas.width, canvas.height) / 2 * 0.8;
+    if (maxR > 0) trajScale = Math.min(80, halfMin / maxR);
+
+    drawTraj();
+  });
+}
+
+function drawTraj() {
+  const canvas = document.getElementById('cv-overview');
+  if (!canvas) return;
+  const W = canvas.width, H = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const cx = W / 2, cy = H / 2;
+
+  // Background
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, W, H);
+
+  // 1-metre grid
+  const gridPx = trajScale;
+  ctx.strokeStyle = '#161616';
+  ctx.lineWidth = 1;
+  for (let x = cx % gridPx; x < W; x += gridPx) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let y = cy % gridPx; y < H; y += gridPx) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // Centre cross
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+
+  // Scale label
+  ctx.fillStyle = '#2e2e2e';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('1 m', cx + gridPx + 3, cy - 4);
+
+  if (trajPoints.length === 0) {
+    ctx.fillStyle = '#252525';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for odometry…', cx, cy);
+    return;
+  }
+
+  // Start dot (green)
+  const s = trajPoints[0];
+  ctx.beginPath();
+  ctx.arc(cx + s.x * trajScale, cy - s.y * trajScale, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#4ade80';
+  ctx.fill();
+
+  // Trajectory line (blue)
+  if (trajPoints.length > 1) {
+    ctx.beginPath();
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2;
+    trajPoints.forEach((p, i) => {
+      const px = cx + p.x * trajScale, py = cy - p.y * trajScale;
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  }
+
+  // Current position dot + orientation arrow (red)
+  const cur = trajPoints[trajPoints.length - 1];
+  const rx = cx + cur.x * trajScale, ry = cy - cur.y * trajScale;
+  ctx.beginPath();
+  ctx.arc(rx, ry, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#f87171';
+  ctx.fill();
+
+  const arLen = 14;
+  ctx.beginPath();
+  ctx.strokeStyle = '#f87171';
+  ctx.lineWidth = 2;
+  ctx.moveTo(rx, ry);
+  ctx.lineTo(rx + arLen * Math.cos(cur.yaw), ry - arLen * Math.sin(cur.yaw));
+  ctx.stroke();
+
+  // Distance label
+  const dist = Math.hypot(cur.x, cur.y).toFixed(2);
+  ctx.fillStyle = '#3a3a3a';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`dist: ${dist} m  pts: ${trajPoints.length}`, 8, H - 8);
+}
+
+function resetTraj() {
+  trajPoints = [];
+  trajOrigin = null;
+  trajScale  = 80;
+  drawTraj();
+}
+
+// ── Send ───────────────────────────────────────────────────────────────────────
+function sendCmd() {
+  const ta   = document.getElementById('cmd-input');
+  const text = ta.value.trim();
+  if (!text || !ros || !ros.isConnected) return;
+
+  lastStatusKey = '';
+  userMsg(text);
+  cmdPub.publish(new ROSLIB.Message({ data: text }));
+  ta.value = '';
+  autoResize(ta);
+  ensureTyping();
+  setTypingLabel('Understanding command…');
+}
+
+function fill(t) {
+  const ta = document.getElementById('cmd-input');
+  ta.value = t; autoResize(ta); ta.focus();
+}
+
+function onKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCmd(); }
+}
+
+function autoResize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 110) + 'px';
+}
+
+// ── DOM helpers ────────────────────────────────────────────────────────────────
+function userMsg(text) {
+  const row = mkEl('div', 'msg-row user');
+  row.innerHTML = '<div class="msg-who">You</div>' +
+    '<div class="msg-bubble">' + esc(text) + '</div>';
+  append(row);
+}
+
+function robotMsg(text) {
+  dropTyping();
+  const row = mkEl('div', 'msg-row robot');
+  row.innerHTML = '<div class="msg-who">PuzzleBot</div>' +
+    '<div class="msg-bubble">' + esc(text) + '</div>';
+  append(row);
+}
+
+function sysMsg(text) {
+  const d = mkEl('div', 'msg-sys');
+  d.textContent = text;
+  append(d);
+}
+
+function ensureTyping() {
+  if (typingRow) return;
+  typingRow = mkEl('div', 'msg-row robot');
+  typingRow.innerHTML =
+    '<div class="msg-who">PuzzleBot</div>' +
+    '<div class="typing-wrap">' +
+      '<div class="typing"><span></span><span></span><span></span></div>' +
+      '<div class="typing-label"></div>' +
+    '</div>';
+  append(typingRow);
+}
+
+function setTypingLabel(text) {
+  if (!typingRow) return;
+  typingRow.querySelector('.typing-label').textContent = text;
+  document.getElementById('messages').scrollTop = 9999;
+}
+
+function dropTyping() {
+  if (typingRow) { typingRow.remove(); typingRow = null; }
+}
+
+function mkEl(tag, cls) {
+  const e = document.createElement(tag); e.className = cls; return e;
+}
+
+function append(node) {
+  const box = document.getElementById('messages');
+  box.appendChild(node);
+  box.scrollTop = box.scrollHeight;
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setDot(cls, label) {
+  const d = document.getElementById('conn-dot');
+  d.className = 'dot' + (cls ? ' ' + cls : '');
+  document.getElementById('conn-label').textContent = label;
+}
+</script>
+</body>
+</html>

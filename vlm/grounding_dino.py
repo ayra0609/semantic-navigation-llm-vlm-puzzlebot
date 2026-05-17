@@ -22,7 +22,7 @@ def load_model():
     return _processor, _model, _device
 
 
-def detect_object(image: Image.Image, target: str, threshold: float = 0.3) -> dict:
+def detect_object(image: Image.Image, target: str, threshold: float = 0.25) -> dict:
     """
     Detect target object in image using Grounding DINO.
 

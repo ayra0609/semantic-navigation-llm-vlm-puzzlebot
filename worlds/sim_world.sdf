@@ -1,0 +1,338 @@
+<?xml version="1.0" ?>
+<!--
+  sim_world.sdf
+  ─────────────────────────────────────────────────────────────────
+  Gazebo Fortress world for the LLM-VLM pipeline.
+
+  Contains:
+    • Ground plane
+    • Red target box  (at x=3, y=0)  — VLM target: "red box"
+    • PuzzleBot robot with real 3D meshes (chassis1.dae + wheel.dae)
+    • Overhead bird's-eye overview camera
+
+  Mesh files must be present at:
+    worlds/meshes/chassis1.dae
+    worlds/meshes/wheel.dae
+
+  ROS2 topics (via ros_gz_bridge):
+    /video_source/raw    ← front camera   (sensor_msgs/Image)
+    /overview/raw        ← top-down view  (sensor_msgs/Image)
+    /cmd_vel             ← velocity cmd   (geometry_msgs/Twist)
+    /odom                ← odometry       (nav_msgs/Odometry)
+
+  Usage:
+    ros2 launch launch/sim_launch.py
+-->
+<sdf version="1.8">
+<world name="llm_vlm_test">
+
+  <!-- ── Required system plugins ──────────────────────────────── -->
+  <plugin filename="ignition-gazebo-physics-system"
+          name="ignition::gazebo::systems::Physics"/>
+  <plugin filename="ignition-gazebo-user-commands-system"
+          name="ignition::gazebo::systems::UserCommands"/>
+  <plugin filename="ignition-gazebo-scene-broadcaster-system"
+          name="ignition::gazebo::systems::SceneBroadcaster"/>
+  <!-- Sensors system is required for all camera sensors in the world -->
+  <plugin filename="ignition-gazebo-sensors-system"
+          name="ignition::gazebo::systems::Sensors">
+    <render_engine>ogre</render_engine>
+  </plugin>
+
+  <!-- ── Physics ──────────────────────────────────────────────── -->
+  <physics name="default_physics" type="dart">
+    <max_step_size>0.001</max_step_size>
+    <real_time_factor>1.0</real_time_factor>
+  </physics>
+
+  <!-- ── Lighting ─────────────────────────────────────────────── -->
+  <light type="directional" name="sun">
+    <cast_shadows>true</cast_shadows>
+    <pose>0 0 10 0 0 0</pose>
+    <diffuse>1.0 1.0 1.0 1</diffuse>
+    <specular>0.3 0.3 0.3 1</specular>
+    <direction>-0.5 0.1 -0.9</direction>
+    <attenuation>
+      <range>1000</range>
+      <constant>0.9</constant>
+      <linear>0.01</linear>
+      <quadratic>0.001</quadratic>
+    </attenuation>
+  </light>
+
+  <!-- ── Ground plane ─────────────────────────────────────────── -->
+  <model name="ground_plane">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision">
+        <geometry>
+          <plane><normal>0 0 1</normal><size>50 50</size></plane>
+        </geometry>
+        <surface><friction><ode><mu>100</mu><mu2>50</mu2></ode></friction></surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <plane><normal>0 0 1</normal><size>50 50</size></plane>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1</ambient>
+          <diffuse>0.6 0.6 0.6 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+
+  <!-- ── Target: RED BOX (3 m ahead of robot) ─────────────────── -->
+  <!--   VLM query: "red box" or "red cube"                        -->
+  <model name="target_box">
+    <static>true</static>
+    <pose>3 0 0.3 0 0 0</pose>
+    <link name="link">
+      <collision name="collision">
+        <geometry><box><size>0.5 0.5 0.6</size></box></geometry>
+      </collision>
+      <visual name="visual">
+        <geometry><box><size>0.5 0.5 0.6</size></box></geometry>
+        <material>
+          <ambient>0.9 0.1 0.1 1</ambient>
+          <diffuse>0.9 0.1 0.1 1</diffuse>
+          <specular>0.3 0.0 0.0 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+
+  <!-- ── PuzzleBot robot with official 3D meshes ───────────────── -->
+  <!--
+    Geometry taken from puzzlebot_ros_official/gazebo/puzzlebot_camera/model.sdf
+    Plugin replaced: libDiffDynamicPlugin.so (Garden/Harmonic only)
+               with: libignition-gazebo-diff-drive-system.so  (Fortress)
+
+    Coordinate frame:
+      model origin  →  ground (z=0)
+      chassis link  →  z=0.05 above model origin (= wheel radius)
+      left_wheel    →  chassis + (0, +0.095, 0)
+      right_wheel   →  chassis + (0, -0.095, 0)
+      caster        →  chassis + (-0.145, 0, -0.044)
+  -->
+  <model name="robot">
+    <pose>0 0 0 0 0 0</pose>
+
+    <!-- ── Chassis ── -->
+    <link name="chassis">
+      <pose relative_to="__model__">0 0 0.05 0 0 0</pose>
+      <inertial>
+        <mass>0.8</mass>
+        <pose>-0.05 0 0 0 0 0</pose>
+        <inertia>
+          <ixx>0.004</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.004</iyy><iyz>0</iyz>
+          <izz>0.004</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry>
+          <mesh><uri>./meshes/chassis1.dae</uri></mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <pose>-0.055 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.2 0.16 0.046</size></box>
+        </geometry>
+      </collision>
+
+      <!-- Front-facing camera — 10 cm forward, 6 cm above chassis centre -->
+      <sensor name="front_camera" type="camera">
+        <topic>video_source/raw</topic>
+        <pose>0.10 0 0.06 0 0 0</pose>
+        <always_on>1</always_on>
+        <update_rate>15</update_rate>
+        <visualize>false</visualize>
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip><near>0.05</near><far>30</far></clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
+      </sensor>
+    </link>
+
+    <!-- ── Right wheel ── -->
+    <link name="right_wheel">
+      <pose relative_to="chassis">0.0 -0.095 0 0 0 3.1415926</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.002</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.002</iyy><iyz>0</iyz>
+          <izz>0.002</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry>
+          <mesh><uri>./meshes/wheel.dae</uri></mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <pose>0 -0.0125 0 1.5707963 0 0</pose>
+        <geometry>
+          <cylinder><radius>0.05</radius><length>0.025</length></cylinder>
+        </geometry>
+        <surface>
+          <friction><ode><mu>100</mu><mu2>50</mu2></ode></friction>
+          <contact><ode><kp>1e6</kp><kd>10</kd><min_depth>0.001</min_depth></ode></contact>
+        </surface>
+      </collision>
+    </link>
+
+    <!-- ── Left wheel ── -->
+    <link name="left_wheel">
+      <pose relative_to="chassis">0.0 0.095 0 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.002</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.002</iyy><iyz>0</iyz>
+          <izz>0.002</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry>
+          <mesh><uri>./meshes/wheel.dae</uri></mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <pose>0 -0.0125 0 1.5707963 0 0</pose>
+        <geometry>
+          <cylinder><radius>0.05</radius><length>0.025</length></cylinder>
+        </geometry>
+        <surface>
+          <friction><ode><mu>100</mu><mu2>50</mu2></ode></friction>
+          <contact><ode><kp>1e6</kp><kd>10</kd><min_depth>0.001</min_depth></ode></contact>
+        </surface>
+      </collision>
+    </link>
+
+    <!-- ── Caster wheel ── -->
+    <frame name="caster_frame" attached_to="chassis">
+      <pose>-0.145 0 -0.044 0 0 0</pose>
+    </frame>
+
+    <link name="caster">
+      <pose relative_to="caster_frame">0 0 0 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>0.0000025</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.0000025</iyy><iyz>0</iyz>
+          <izz>0.0000025</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry><sphere><radius>0.006</radius></sphere></geometry>
+        <material>
+          <ambient>0.3 0.3 0.3 1</ambient>
+          <diffuse>0.3 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry><sphere><radius>0.006</radius></sphere></geometry>
+        <surface><friction><ode><mu>0.0</mu><mu2>0.0</mu2></ode></friction></surface>
+      </collision>
+    </link>
+
+    <!-- ── Joints ── -->
+    <!--
+      axis xyz without expressed_in = axis in the joint's own frame.
+      The wheel links have no rotation, so joint frame = chassis frame = model frame.
+      Y axis (0 1 0) → wheels spin around the lateral axis → robot moves in X.
+      Effort and friction kept minimal so the standard DiffDrive plugin can
+      drive the wheels without fighting against joint limits.
+    -->
+    <joint name="left_wheel_joint" type="revolute">
+      <parent>chassis</parent>
+      <child>left_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <limit>
+          <lower>-1e16</lower>
+          <upper>1e16</upper>
+        </limit>
+        <dynamics><damping>0.001</damping><friction>0.0</friction></dynamics>
+      </axis>
+    </joint>
+
+    <joint name="right_wheel_joint" type="revolute">
+      <parent>chassis</parent>
+      <child>right_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <limit>
+          <lower>-1e16</lower>
+          <upper>1e16</upper>
+        </limit>
+        <dynamics><damping>0.001</damping><friction>0.0</friction></dynamics>
+      </axis>
+    </joint>
+
+    <joint name="caster_wheel" type="ball">
+      <parent>chassis</parent>
+      <child>caster</child>
+    </joint>
+
+    <!-- ── Differential Drive plugin (Fortress) ── -->
+    <plugin filename="libignition-gazebo-diff-drive-system.so"
+            name="ignition::gazebo::systems::DiffDrive">
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>0.19</wheel_separation>
+      <wheel_radius>0.05</wheel_radius>
+      <odom_publish_frequency>10</odom_publish_frequency>
+      <topic>cmd_vel</topic>
+      <odom_topic>odom</odom_topic>
+      <frame_id>odom</frame_id>
+      <child_frame_id>chassis</child_frame_id>
+      <min_acceleration>-5</min_acceleration>
+      <max_acceleration>5</max_acceleration>
+    </plugin>
+
+  </model>
+
+  <!-- ── Overview camera (fixed, bird's-eye view) ──────────────────
+       Positioned 5 m above the midpoint between robot (x=0) and
+       target (x=3).  Pitch=90° rotates the camera to look straight down.
+       FOV=90°: at h=5 covers ±5 m horizontally — shows full journey.
+  ────────────────────────────────────────────────────────────────── -->
+  <model name="overview_cam">
+    <static>true</static>
+    <pose>1.5 0 5 0 1.5707963 0</pose>
+    <link name="link">
+      <sensor name="overview_camera" type="camera">
+        <topic>overview/raw</topic>
+        <always_on>1</always_on>
+        <update_rate>5</update_rate>
+        <visualize>false</visualize>
+        <camera>
+          <horizontal_fov>1.5708</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>640</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip><near>0.1</near><far>30</far></clip>
+        </camera>
+      </sensor>
+    </link>
+  </model>
+
+</world>
+</sdf>
