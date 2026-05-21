@@ -36,7 +36,7 @@ LOGDIR="$PROJECT_ROOT/project_log"
 mkdir -p "$LOGDIR"
 LOGFILE="$LOGDIR/$(date +%Y%m%d%H%M).log"
 
-JETSON_IP="${1:-172.20.10.2}"
+JETSON_IP="${1:-100.112.165.86}"
 JETSON_USER="jetson"
 JETSON_PROJECT="/home/jetson/semantic_navigation"
 JETSON_ROS_SETUP="/opt/ros/foxy/setup.bash"
@@ -107,15 +107,19 @@ else
   FAIL=1
 fi
 
-# NCC script check
+# NCC script check — always sync if local is newer or checksums differ
 info "Checking NCC inference script…"
-if ssh -o ConnectTimeout=5 -o BatchMode=yes \
-       "${NCC_USER}@${NCC_HOST}" "test -f ${NCC_SCRIPT}" 2>/dev/null; then
-  ok "NCC script found: ${NCC_SCRIPT}"
+LOCAL_SUM="$(md5sum "$PROJECT_ROOT/ncc_inference_server.py" 2>/dev/null | cut -d' ' -f1)"
+REMOTE_SUM="$(ssh -o ConnectTimeout=5 -o BatchMode=yes \
+    "${NCC_USER}@${NCC_HOST}" "md5sum ${NCC_SCRIPT} 2>/dev/null | cut -d' ' -f1" 2>/dev/null)"
+if [ "$LOCAL_SUM" = "$REMOTE_SUM" ] && [ -n "$LOCAL_SUM" ]; then
+  ok "NCC script up-to-date: ${NCC_SCRIPT}"
 else
-  error "NCC script not found: ${NCC_SCRIPT}"
-  error "Upload ncc_inference_server.py to NCC first"
-  FAIL=1
+  warn "NCC script differs — uploading latest version…"
+  scp "$PROJECT_ROOT/ncc_inference_server.py" \
+      "${NCC_USER}@${NCC_HOST}:${NCC_SCRIPT}" 2>/dev/null \
+    && ok "Uploaded ncc_inference_server.py to NCC" \
+    || { error "Upload failed: scp $PROJECT_ROOT/ncc_inference_server.py ${NCC_USER}@${NCC_HOST}:${NCC_SCRIPT}"; FAIL=1; }
 fi
 
 [[ $FAIL -ne 0 ]] && {

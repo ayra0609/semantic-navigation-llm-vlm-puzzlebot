@@ -42,13 +42,16 @@ def detect_object(image: Image.Image, target: str, threshold: float = 0.25) -> d
     with torch.no_grad():
         outputs = model(**inputs)
 
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        threshold=threshold,
-        text_threshold=threshold,
-        target_sizes=[image.size[::-1]]
-    )
+    try:
+        results = processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids,
+            box_threshold=threshold, text_threshold=threshold,
+            target_sizes=[image.size[::-1]])
+    except TypeError:
+        results = processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids,
+            threshold=threshold, text_threshold=threshold,
+            target_sizes=[image.size[::-1]])
 
     boxes = results[0]["boxes"]
     scores = results[0]["scores"]

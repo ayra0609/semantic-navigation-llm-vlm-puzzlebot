@@ -70,7 +70,6 @@ main {
 .cam-ph svg { opacity: 0.4; }
 .cam-ph span { font-size: 0.72rem; color: #282828; }
 
-/* 鈹€鈹€ Chat panel 鈹€鈹€ */
 .chat-panel {
   display: flex; flex-direction: column;
   background: #1a1a1a; overflow: hidden;
@@ -343,7 +342,7 @@ function revealCanvas(canvasId, phId) {
 // 鈹€鈹€ Status 鈫?chat 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 function handleStatus(raw) {
   if (raw.startsWith('ARRIVED')) {
-    robotMsg('Target reached. I have arrived at the destination.');
+    robotMsg(fmtStatus(raw));
     return;
   }
 
@@ -355,9 +354,15 @@ function handleStatus(raw) {
     lastStatusKey = key;
     return;
   }
+  if (raw.startsWith('STOPPED')) {
+    dropTyping();
+    robotMsg(fmtStatus(raw));
+    lastStatusKey = key;
+    return;
+  }
   if (raw.startsWith('ERROR')) {
     dropTyping();
-    robotMsg('Error: ' + fmtStatus(raw));
+    robotMsg(fmtStatus(raw));
     lastStatusKey = key;
     return;
   }
@@ -368,17 +373,26 @@ function handleStatus(raw) {
 }
 
 function fmtStatus(s) {
-  if (s.startsWith('LOADING'))              return 'Loading VLM model, please wait';
-  if (s.startsWith('IDLE'))                 return 'Ready - waiting for command';
-  if (s.startsWith('PROCESSING'))           return 'Understanding command';
-  if (s.includes('Waiting for camera'))     return 'Waiting for camera feed';
-  if (s.includes('Loading VLM'))            return 'Loading VLM model';
-  if (s.includes('detected'))               return 'Target detected - moving toward it';
+  if (s.startsWith('ARRIVED'))              return 'I have arrived and stopped.';
+  if (s.startsWith('STOPPED'))              return 'Okay, I have stopped.';
+  if (s.startsWith('LOADING'))              return 'I am loading the vision model. One moment.';
+  if (s.startsWith('IDLE'))                 return 'I am ready for a command.';
+  if (s.startsWith('PROCESSING'))           return 'I am understanding your command.';
+  if (s.includes('Waiting for camera'))     return 'I am waiting for the camera feed.';
+  if (s.includes('Loading VLM'))            return 'I am loading the vision model.';
+  if (s.includes('Target detected') || s.includes('detected')) {
+    return 'I can see the target. I am moving closer.';
+  }
+  if (s.includes('Target locked'))          return 'I have remembered the target position and I am moving closer.';
   if (s.startsWith('NAVIGATING: Heading')) {
     const m = s.match(/Heading to "(.+)"/);
-    return m ? 'Navigating to: ' + m[1] : 'Navigating';
+    return m ? 'I am going to look for ' + m[1] + '.' : 'I am ready to move.';
   }
-  if (s.startsWith('NAVIGATING'))           return 'Searching for target - robot rotating';
+  if (s.startsWith('NAVIGATING'))           return 'I am looking for the target.';
+  if (s.startsWith('ERROR: Target lost'))   return 'I lost the target. I saw it before, but I cannot see it now.';
+  if (s.startsWith('ERROR: Could not find')) return 'I could not find the target, so I stopped.';
+  if (s.startsWith('ERROR: Obstacle'))      return 'There is something in front of me, so I stopped.';
+  if (s.startsWith('ERROR: Collision'))     return 'I may have bumped into something or got stuck, so I stopped.';
   if (s.startsWith('ERROR'))                return s.replace(/^ERROR:\s*/, '');
   return s;
 }

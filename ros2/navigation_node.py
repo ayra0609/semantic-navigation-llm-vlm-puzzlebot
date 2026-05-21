@@ -52,28 +52,51 @@ class NavigationNode(Node):
     IMAGE_HEIGHT   = 480
     IMAGE_CENTER_X = IMAGE_WIDTH / 2
 
-    LINEAR_SPEED   = 0.15   # m/s -- forward speed once aligned
+    LINEAR_SPEED   = 0.10   # m/s -- forward speed once aligned
 
     # Alignment threshold: must be centered within this many pixels
     # 80px is more forgiving of DINO bounding-box jitter on the real robot
     CENTER_TOLERANCE = 80   # pixels (was 40 -- too tight for 0.5 Hz DINO)
 
     # Stop conditions
-    STOP_AREA_RATIO      = 0.40   # stop when bbox covers 40% of image
+    STOP_AREA_RATIO      = 0.35   # stop when bbox covers 35% of image
     STOP_AREA_MIN_SCORE  = 0.60   # area-based stop requires this confidence
-    LIDAR_STOP_DISTANCE  = 0.40   # stop if obstacle within 0.4 m
+    CLOSE_RANGE_AREA     = 0.20   # target is visually close even if depth is noisy
+    BBOX_BOTTOM_STOP_RATIO = 0.92 # stop if bbox bottom is near image bottom
+    CLOSE_RANGE_DEPTH    = 1.20   # after this, target identity may become partial
+    USE_LIDAR            = False  # real PuzzleBot setup has no LiDAR
+    LIDAR_STOP_DISTANCE  = 0.40   # unused on the real robot if no /scan data is available
     MIN_DETECTION_SCORE  = 0.25   # ignore low-confidence detections
     DR_MIN_SCORE         = 0.50   # min score to update dead-reckoning distance
-    DIST_STOP_DISTANCE   = 0.30   # stop immediately when depth reading is this close
+    DIST_STOP_DISTANCE   = 0.50   # stop when fresh depth says target is close
+    DR_ARRIVE_MARGIN     = 0.20   # backup clearance; live depth is the primary stop
+    DR_BACKUP_STOP       = False  # keep DR for logs only; stop primarily by live depth
+    DR_RECALIBRATE_INTERVAL_S = 2.0  # re-anchor DR after this much forward motion
+    FINAL_APPROACH_DISTANCE = 1.60   # below this, depth tends to plateau on chair legs
+    FINAL_APPROACH_EXTRA_M  = 0.30   # short backup crawl after entering final approach
+    DR_OUTLIER_JUMP_M       = 1.50   # reject sudden depth jumps away from target
+    DR_OUTLIER_RATIO        = 1.80   # reject distance much larger than current DR remainder
+    LOCKED_TARGET_FALLBACK_TIMEOUT = 1.5  # use old target pose only after fresh vision drops out
+
+    # Collision / stall detection from odometry. This is not a physical bumper:
+    # it detects "I am commanding motion, but the robot is not actually moving".
+    COLLISION_DETECTION       = True
+    COLLISION_CHECK_WINDOW_S  = 1.8
+    COLLISION_MIN_LINEAR_CMD  = 0.06
+    COLLISION_MIN_ANGULAR_CMD = 0.18
+    COLLISION_MIN_TRANSLATION = 0.025
+    COLLISION_MIN_ROTATION    = 0.08
 
     # Detection hysteresis
     # How long (s) to keep using the last positive detection before switching
     # to SEARCH mode. Without this, a single missed DINO frame immediately
     # stops forward motion and starts the robot spinning.
     DETECTION_TIMEOUT = 4.0   # seconds
-    SEARCH_TIMEOUT    = 10.0  # seconds without detection before stopping
+    SEARCH_TIMEOUT    = 25.0  # seconds without detection before stopping
+    SEARCH_ANGULAR    = 0.20  # rad/s, enough to scan most of a room before timeout
+    CLOSE_RANGE_LOST_STOP_S = 2.5  # DINO is ~0.5 Hz; stop if close target misses a frame
     FOCAL_PX         = 644.69
-    ARRIVE_THRESHOLD = 0.25
+    ARRIVE_THRESHOLD = 0.40
     # Direct-motion speeds
     DIRECT_LINEAR  = 0.15   # m/s   (forward / backward)
     DIRECT_ANGULAR = 0.40   # rad/s (left / right in-place turn)
@@ -85,6 +108,14 @@ class NavigationNode(Node):
         '__left':     ( 0.0,   0.40),
         '__right':    ( 0.0,  -0.40),
     }
+
+    STATE_ARRIVED        = 'arrived'
+    STATE_OBSTACLE       = 'obstacle'
+    STATE_DIRECT         = 'direct'
+    STATE_CLOSE_LOST     = 'close_lost'
+    STATE_LOCKED_MEMORY  = 'locked_memory'
+    STATE_SEARCHING      = 'searching'
+    STATE_TRACKING       = 'tracking'
 
     def __init__(self):
         super().__init__('navigation_node')
@@ -113,7 +144,14 @@ class NavigationNode(Node):
         # Dead-reckoning stop (used when odometry unavailable but depth available)
         self._dr_dist      = None  # latest distance estimate from depth
         self._dr_advance_s = 0.0   # seconds spent advancing since last dist update
+        self._dr_last_recal_s = 0.0
+        self._final_approach_locked = False
+        self._final_approach_total = None
         self._dist_arrived = False  # set when live depth reading reaches DIST_STOP_DISTANCE
+        self._visual_arrived = False
+        self._close_range_seen = False
+        self._collision_ref_pose = None
+        self._collision_ref_time = None
         # Subscribers
         self.create_subscription(String,   '/nav_target',       self.target_callback,    10)
         self.create_subscription(String,   '/detection_result', self.detection_callback, 10)
@@ -154,6 +192,15 @@ class NavigationNode(Node):
             self._nav_start_wall    = time.time()
             self._search_start_wall = None
             self._ever_detected     = False
+            self._dr_dist           = None
+            self._dr_advance_s      = 0.0
+            self._dr_last_recal_s   = 0.0
+            self._final_approach_locked = False
+            self._final_approach_total = None
+            self._dist_arrived      = False
+            self._visual_arrived    = False
+            self._close_range_seen  = False
+            self._reset_collision_watchdog()
             self.pid.reset()
             self.get_logger().info(f'[NAV_TARGET] new goal "{self.target}"')
             self.get_logger().info(
@@ -175,6 +222,15 @@ class NavigationNode(Node):
         self._nav_start_wall    = time.time()
         self._search_start_wall = None
         self._ever_detected     = False
+        self._dr_dist           = None
+        self._dr_advance_s      = 0.0
+        self._dr_last_recal_s   = 0.0
+        self._final_approach_locked = False
+        self._final_approach_total = None
+        self._dist_arrived      = False
+        self._visual_arrived    = False
+        self._close_range_seen  = False
+        self._reset_collision_watchdog()
         self.pid.reset()
         self.get_logger().info(f'[NAV_TARGET] new goal "{self.target}"')
         self._publish_status(f'NAVIGATING: Searching for "{self.target}"')
@@ -198,32 +254,113 @@ class NavigationNode(Node):
                 self._ever_detected       = True
                 self.get_logger().info(
                     f'[DETECTION] found=True  score={score:.2f}  '
-                    f'cx={data.get("center_x", 0):.0f}')
+                    f'cx={data.get("center_x", 0):.0f}  '
+                    f'dist={data.get("distance_m", "?")}m  '
+                    f'method={data.get("dist_method", "?")}')
 
                 dist_m = data.get('distance_m', None)
+                box = data.get('box', [0, 0, 0, 0])
+                img_w = data.get('image_width', self.IMAGE_WIDTH)
+                img_h = data.get('image_height', self.IMAGE_HEIGHT)
+                try:
+                    box_area = max(0.0, (box[2] - box[0]) * (box[3] - box[1]))
+                    area_ratio = box_area / float(img_w * img_h) if img_w > 0 and img_h > 0 else 0.0
+                    bottom_ratio = box[3] / float(img_h) if img_h > 0 else 0.0
+                except Exception:
+                    area_ratio = 0.0
+                    bottom_ratio = 0.0
 
                 # Immediate stop when live depth says we are close enough.
-                # DR tracking can lag behind the actual distance due to noise,
-                # so this direct check prevents the robot from ramming the target.
+                # Use MIN_DETECTION_SCORE (not DR_MIN_SCORE): depth accuracy is
+                # independent of DINO classification confidence, and at close range
+                # the score often drops as the camera sees only chair legs.
                 if (dist_m and dist_m <= self.DIST_STOP_DISTANCE
-                        and score >= self.DR_MIN_SCORE and self.navigating):
+                        and score >= self.MIN_DETECTION_SCORE and self.navigating):
                     self.get_logger().info(
                         f'[DIST_ARRIVED] live dist={dist_m:.2f}m <= {self.DIST_STOP_DISTANCE}m -- flagging stop')
                     self._dist_arrived = True
+
+                if ((dist_m and dist_m <= self.CLOSE_RANGE_DEPTH)
+                        or area_ratio >= self.CLOSE_RANGE_AREA
+                        or bottom_ratio >= 0.85):
+                    if not self._close_range_seen:
+                        self.get_logger().info(
+                            f'[CLOSE_RANGE] dist={dist_m if dist_m else "?"}m  '
+                            f'area={area_ratio:.2f}  bottom={bottom_ratio:.2f}')
+                    self._close_range_seen = True
+
+                if (area_ratio >= self.STOP_AREA_RATIO and score >= self.STOP_AREA_MIN_SCORE):
+                    self.get_logger().info(
+                        f'[VISUAL_ARRIVED] area={area_ratio:.2f} >= {self.STOP_AREA_RATIO:.2f}')
+                    self._visual_arrived = True
+                elif (bottom_ratio >= self.BBOX_BOTTOM_STOP_RATIO
+                        and self._close_range_seen
+                        and score >= self.MIN_DETECTION_SCORE):
+                    self.get_logger().info(
+                        f'[VISUAL_ARRIVED] bbox_bottom={bottom_ratio:.2f} '
+                        f'>= {self.BBOX_BOTTOM_STOP_RATIO:.2f}')
+                    self._visual_arrived = True
 
                 # Update dead-reckoning estimate (high-confidence detections only).
                 # Total distance can only decrease — prevents inflated estimates from
                 # a bbox that is wider than TARGET_WIDTH_M from extending the journey.
                 if dist_m and dist_m > self.ARRIVE_THRESHOLD and score >= self.DR_MIN_SCORE:
                     covered = self._dr_advance_s * self.LINEAR_SPEED
+                    dr_remaining = None
+                    if self._dr_dist is not None:
+                        dr_remaining = max(0.0, self._dr_dist - covered)
+                    if self._final_approach_locked and dist_m > self.FINAL_APPROACH_DISTANCE:
+                        self.get_logger().warn(
+                            f'[DR_OUTLIER] final approach locked; ignoring '
+                            f'dist={dist_m:.2f}m  covered={covered:.2f}m')
+                        return
+                    if (dr_remaining is not None
+                            and dist_m > dr_remaining + self.DR_OUTLIER_JUMP_M
+                            and dist_m > dr_remaining * self.DR_OUTLIER_RATIO):
+                        self.get_logger().warn(
+                            f'[DR_OUTLIER] ignoring dist={dist_m:.2f}m  '
+                            f'dr_remaining={dr_remaining:.2f}m  covered={covered:.2f}m')
+                        return
                     new_total = covered + dist_m
+                    if dist_m <= self.FINAL_APPROACH_DISTANCE:
+                        # At close range the low camera often sees chair legs,
+                        # and the distance estimate can stop decreasing around
+                        # 1.5 m. Do not blindly drive all of that reported
+                        # distance; creep a short calibrated extra distance.
+                        if not self._final_approach_locked:
+                            self._final_approach_locked = True
+                            self._final_approach_total = (
+                                covered + self.FINAL_APPROACH_EXTRA_M + self.DR_ARRIVE_MARGIN)
+                            self.get_logger().info(
+                                f'[DR_FINAL_LOCK] dist={dist_m:.2f}m  '
+                                f'covered={covered:.2f}m  '
+                                f'total={self._final_approach_total:.2f}m')
+                        # Use the locked creep distance directly. If the depth
+                        # model underestimates the chair distance, min() would
+                        # make _dr_dist smaller than DR_ARRIVE_MARGIN and the
+                        # robot would declare arrival without moving.
+                        new_total = self._final_approach_total
+                        self.get_logger().info(
+                            f'[DR_FINAL_CAP] dist={dist_m:.2f}m  '
+                            f'covered={covered:.2f}m  total_cap={new_total:.2f}m')
                     if self._dr_dist is None:
                         self._dr_dist = new_total
+                        self._dr_last_recal_s = self._dr_advance_s
+                        self.get_logger().info(
+                            f'[DR_INIT] remaining={dist_m:.2f}m  covered={covered:.2f}m  '
+                            f'total={self._dr_dist:.2f}m')
+                    elif self._dr_advance_s - self._dr_last_recal_s >= self.DR_RECALIBRATE_INTERVAL_S:
+                        old_total = self._dr_dist
+                        self._dr_dist = min(self._dr_dist, new_total)
+                        self._dr_last_recal_s = self._dr_advance_s
+                        self.get_logger().info(
+                            f'[DR_RECAL] remaining={dist_m:.2f}m  covered={covered:.2f}m  '
+                            f'total={old_total:.2f}->{self._dr_dist:.2f}m')
                     else:
                         self._dr_dist = min(self._dr_dist, new_total)
-                    self.get_logger().info(
-                        f'[DR] remaining={dist_m:.2f}m  covered={covered:.2f}m  '
-                        f'total={self._dr_dist:.2f}m')
+                        self.get_logger().info(
+                            f'[DR] remaining={dist_m:.2f}m  covered={covered:.2f}m  '
+                            f'total={self._dr_dist:.2f}m')
 
                 if (dist_m and self.current_pose and self.target_world_pos is None and dist_m > self.ARRIVE_THRESHOLD):
                     cx        = data.get('center_x', self.IMAGE_CENTER_X)
@@ -289,15 +426,16 @@ class NavigationNode(Node):
             return
 
         cmd = Twist()
+        nav_state = self._assess_navigation_state()
+        state = nav_state['state']
 
-        # Immediate stop: live depth reading reached DIST_STOP_DISTANCE
-        if self._dist_arrived:
-            self.get_logger().info('[DIST_ARRIVED] stopping -- live depth threshold reached')
+        if state == self.STATE_ARRIVED:
+            self.get_logger().info(
+                f'[STATE] ARRIVED -- {nav_state["reason"]}')
             self.stop_robot('arrived')
             return
 
-        # Safety: LiDAR override
-        if self.lidar_distance < self.LIDAR_STOP_DISTANCE:
+        if state == self.STATE_OBSTACLE:
             self.get_logger().info(
                 f'Obstacle at {self.lidar_distance:.2f}m -- stopping!')
             self.stop_robot('obstacle_stop')
@@ -305,18 +443,26 @@ class NavigationNode(Node):
 
         # Direct motion command (__forward / __backward / __left / __right)
         # Executed every tick until a stop or new command arrives.
-        if self._direct_cmd is not None:
+        if state == self.STATE_DIRECT:
             lin, ang = self._direct_cmd
             cmd.linear.x  = lin
             cmd.angular.z = ang
             self.get_logger().info(
                 f'[CMD_VEL] DIRECT  lin={lin:.2f}  ang={ang:.2f}')
-            self.pub_cmd_vel.publish(cmd)
+            self._publish_cmd(cmd)
             return
 
-        # If the target was detected earlier with depth, keep driving to the
-        # locked world position even if the low-mounted camera now only sees legs.
-        if self.target_world_pos is not None and self.current_pose is not None:
+        if state == self.STATE_CLOSE_LOST:
+            self.get_logger().info(
+                '[CLOSE_RANGE_LOST] target was close and fresh vision is stale -- stopping conservatively')
+            self.stop_robot('arrived')
+            return
+
+        # If the target was detected earlier with depth, keep a short spatial
+        # memory only after fresh vision has dropped out. While the target is
+        # visible, visual servoing below remains the primary "am I there yet?"
+        # loop.
+        if state == self.STATE_LOCKED_MEMORY:
             tx, ty = self.target_world_pos
             rx, ry = self.current_pose
             dist   = math.sqrt((tx - rx)**2 + (ty - ry)**2)
@@ -338,16 +484,11 @@ class NavigationNode(Node):
                 f'[NAV_TO_LOCKED_TARGET] dist={dist:.2f}m  '
                 f'yaw_err={math.degrees(yaw_error):.1f}deg  '
                 f'lin={cmd.linear.x:.2f}  ang={cmd.angular.z:.3f}')
-            self.pub_cmd_vel.publish(cmd)
+            self._publish_cmd(cmd)
             return
 
         # No detection (or timed-out): rotate to search
-        detection_valid = (
-            self.detection is not None
-            and self.detection.get('found', False)
-            and (time.time() - self._last_detection_time) < self.DETECTION_TIMEOUT
-        )
-        if not detection_valid:
+        if state == self.STATE_SEARCHING:
             now = time.time()
             if self._search_start_wall is None:
                 self._search_start_wall = now
@@ -359,10 +500,10 @@ class NavigationNode(Node):
                     f'after {search_age:.1f}s -- stopping')
                 self.stop_robot(reason)
                 return
-            cmd.angular.z = 0.15
+            cmd.angular.z = self.SEARCH_ANGULAR
             self.get_logger().info(
-                f'[CMD_VEL] SEARCH "{self.target}"  ang=+0.15')
-            self.pub_cmd_vel.publish(cmd)
+                f'[CMD_VEL] SEARCH "{self.target}"  ang={self.SEARCH_ANGULAR:+.2f}')
+            self._publish_cmd(cmd)
             return
         
         # Target found: visual servoing
@@ -376,10 +517,9 @@ class NavigationNode(Node):
         image_area = image_width * image_height
         area_ratio = box_area / image_area if image_area > 0 else 0
 
-        # Area-based stop only when no depth estimate available (DR not active).
-        # When DR is active, distance-based stop takes over in Phase 2.
-        if (area_ratio > self.STOP_AREA_RATIO and score >= self.STOP_AREA_MIN_SCORE
-                and self._dr_dist is None):
+        # Area-based safety stop: if the target visually fills the frame,
+        # stop even if depth is noisy or unavailable.
+        if area_ratio > self.STOP_AREA_RATIO and score >= self.STOP_AREA_MIN_SCORE:
             self.get_logger().info(
                 f'Reached "{self.target}"!  area={area_ratio:.2f}  score={score:.2f}')
             self.stop_robot('success')
@@ -400,7 +540,12 @@ class NavigationNode(Node):
             if self.target_world_pos is None and self._dr_dist is not None:
                 self._dr_advance_s += dt * 0.5  # half speed → half DR credit
                 dist_covered = self._dr_advance_s * self.LINEAR_SPEED
-                if dist_covered >= self._dr_dist - self.ARRIVE_THRESHOLD:
+                backup_arrival = max(0.0, self._dr_dist - self.DR_ARRIVE_MARGIN)
+                if self._final_approach_locked:
+                    backup_arrival = max(
+                        backup_arrival,
+                        self._final_approach_total - self.DR_ARRIVE_MARGIN)
+                if self.DR_BACKUP_STOP and dist_covered >= backup_arrival:
                     self.get_logger().info(
                         f'[DR_ARRIVED] covered={dist_covered:.2f}m  '
                         f'est={self._dr_dist:.2f}m')
@@ -415,7 +560,12 @@ class NavigationNode(Node):
             if self.target_world_pos is None and self._dr_dist is not None:
                 self._dr_advance_s += dt
                 dist_covered = self._dr_advance_s * self.LINEAR_SPEED
-                if dist_covered >= self._dr_dist - self.ARRIVE_THRESHOLD:
+                backup_arrival = max(0.0, self._dr_dist - self.DR_ARRIVE_MARGIN)
+                if self._final_approach_locked:
+                    backup_arrival = max(
+                        backup_arrival,
+                        self._final_approach_total - self.DR_ARRIVE_MARGIN)
+                if self.DR_BACKUP_STOP and dist_covered >= backup_arrival:
                     self.get_logger().info(
                         f'[DR_ARRIVED] covered={dist_covered:.2f}m  '
                         f'est={self._dr_dist:.2f}m')
@@ -435,7 +585,7 @@ class NavigationNode(Node):
 
         # Cap at +/-0.25 rad/s (was 0.5 -- caused 57 deg overshoot per DINO frame)
         cmd.angular.z = max(-0.25, min(0.25, cmd.angular.z))
-        self.pub_cmd_vel.publish(cmd)
+        self._publish_cmd(cmd)
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -450,17 +600,20 @@ class NavigationNode(Node):
         self.get_logger().info(f'[CMD_VEL] STOP  reason={reason}')
         self.pub_cmd_vel.publish(Twist())
         if reason == 'arrived' or reason == 'success':
-            self._publish_status('ARRIVED: Reached target!')
+            self._publish_status('ARRIVED: I have arrived and stopped.')
         elif reason == 'target_lost':
             self._publish_status(
-                f'ERROR: Target lost -- "{stopped_target}" left the camera view')
+                f'ERROR: Target lost -- I lost sight of "{stopped_target}". I saw it before, but I cannot see it now.')
         elif reason == 'search_timeout':
             self._publish_status(
-                f'ERROR: Could not find "{stopped_target}" after searching')
+                f'ERROR: Could not find -- I could not find "{stopped_target}", so I stopped.')
+        elif reason == 'collision':
+            self._publish_status(
+                f'ERROR: Collision detected -- I may have bumped into something or got stuck, so I stopped.')
         elif reason == 'obstacle_stop':
-            self._publish_status('ERROR: Obstacle detected -- navigation stopped')
+            self._publish_status('ERROR: Obstacle detected -- There is something in front of me, so I stopped.')
         elif reason == 'command_stop':
-            self._publish_status('STOPPED')
+            self._publish_status('STOPPED: Okay, I have stopped.')
         self.navigating  = False
         self.detection   = None
         self._direct_cmd = None
@@ -470,7 +623,13 @@ class NavigationNode(Node):
         self._ever_detected     = False
         self._dr_dist      = None
         self._dr_advance_s = 0.0
+        self._dr_last_recal_s = 0.0
+        self._final_approach_locked = False
+        self._final_approach_total = None
         self._dist_arrived = False
+        self._visual_arrived = False
+        self._close_range_seen = False
+        self._reset_collision_watchdog()
         self._log_result(reason)
         self.target = None
         self._nav_start_wall  = None 
@@ -486,11 +645,141 @@ class NavigationNode(Node):
             f'Navigation ended | reason={reason} | '
             f'distance={dist_str} | lidar={self.lidar_distance:.2f}m')
 
+    def _assess_navigation_state(self):
+        """Decide what the robot should believe before choosing a motion."""
+        if self._dist_arrived:
+            return {
+                'state': self.STATE_ARRIVED,
+                'reason': 'live depth threshold reached',
+            }
+
+        if self._visual_arrived:
+            return {
+                'state': self.STATE_ARRIVED,
+                'reason': 'visual close-range threshold reached',
+            }
+
+        if self.USE_LIDAR and self.lidar_distance < self.LIDAR_STOP_DISTANCE:
+            return {
+                'state': self.STATE_OBSTACLE,
+                'reason': 'front obstacle detected',
+            }
+
+        if self._direct_cmd is not None:
+            return {
+                'state': self.STATE_DIRECT,
+                'reason': 'manual/direct motion command',
+            }
+
+        last_positive_age = time.time() - self._last_detection_time
+        detection_valid = (
+            self.detection is not None
+            and self.detection.get('found', False)
+            and last_positive_age < self.DETECTION_TIMEOUT
+        )
+
+        if self._close_range_seen and last_positive_age >= self.CLOSE_RANGE_LOST_STOP_S:
+            return {
+                'state': self.STATE_CLOSE_LOST,
+                'reason': 'target was close but fresh vision is stale',
+            }
+
+        if (
+            self.target_world_pos is not None
+            and self.current_pose is not None
+            and not detection_valid
+            and last_positive_age >= self.LOCKED_TARGET_FALLBACK_TIMEOUT
+        ):
+            return {
+                'state': self.STATE_LOCKED_MEMORY,
+                'reason': 'temporarily using remembered target position',
+            }
+
+        if not detection_valid:
+            return {
+                'state': self.STATE_SEARCHING,
+                'reason': 'target not currently visible',
+            }
+
+        return {
+            'state': self.STATE_TRACKING,
+            'reason': 'fresh visual detection available',
+        }
+
     def _publish_status(self, text: str):
         msg = String()
         msg.data = text
         self.pub_status.publish(msg)
         self.get_logger().info(f'[STATUS] {text}')
+
+    def _reset_collision_watchdog(self):
+        self._collision_ref_pose = None
+        self._collision_ref_time = None
+
+    def _publish_cmd(self, cmd: Twist):
+        if self._collision_detected(cmd):
+            self.get_logger().warn('[COLLISION] commanded motion but odometry is stalled')
+            self.stop_robot('collision')
+            return
+        self.pub_cmd_vel.publish(cmd)
+
+    def _collision_detected(self, cmd: Twist) -> bool:
+        if not self.COLLISION_DETECTION or self.current_pose is None:
+            return False
+
+        linear_cmd = abs(cmd.linear.x)
+        angular_cmd = abs(cmd.angular.z)
+        moving = (
+            linear_cmd >= self.COLLISION_MIN_LINEAR_CMD
+            or angular_cmd >= self.COLLISION_MIN_ANGULAR_CMD
+        )
+        if not moving:
+            self._reset_collision_watchdog()
+            return False
+
+        now = time.time()
+        if self._collision_ref_pose is None or self._collision_ref_time is None:
+            self._collision_ref_pose = (
+                self.current_pose[0],
+                self.current_pose[1],
+                self.current_yaw,
+            )
+            self._collision_ref_time = now
+            return False
+
+        elapsed = now - self._collision_ref_time
+        if elapsed < self.COLLISION_CHECK_WINDOW_S:
+            return False
+
+        x0, y0, yaw0 = self._collision_ref_pose
+        dx = self.current_pose[0] - x0
+        dy = self.current_pose[1] - y0
+        translation = math.sqrt(dx * dx + dy * dy)
+        dyaw = self.current_yaw - yaw0
+        while dyaw > math.pi:
+            dyaw -= 2 * math.pi
+        while dyaw < -math.pi:
+            dyaw += 2 * math.pi
+        rotation = abs(dyaw)
+
+        stalled_linear = (
+            linear_cmd >= self.COLLISION_MIN_LINEAR_CMD
+            and translation < self.COLLISION_MIN_TRANSLATION
+        )
+        stalled_angular = (
+            linear_cmd < self.COLLISION_MIN_LINEAR_CMD
+            and angular_cmd >= self.COLLISION_MIN_ANGULAR_CMD
+            and rotation < self.COLLISION_MIN_ROTATION
+        )
+
+        self._collision_ref_pose = (
+            self.current_pose[0],
+            self.current_pose[1],
+            self.current_yaw,
+        )
+        self._collision_ref_time = now
+
+        return stalled_linear or stalled_angular
 
 
 def main(args=None):

@@ -62,8 +62,35 @@ NCC_SERVER_URL = 'http://localhost:5001/detect'
 USE_NCC        = True
 
 FOCAL_PX       = 644.69
-TARGET_WIDTH_M = 0.50
+TARGET_WIDTH_M = 0.50   # fallback only
 STOP_DIST_M    = 0.50
+
+# Ground-plane distance estimation (camera extrinsics on PuzzleBot)
+# Measure CAM_HEIGHT_M with a ruler; set CAM_PITCH_DEG to 0 if camera is level.
+CAM_HEIGHT_M  = 0.222  # camera height above floor (m)  — measured 2026-05-20
+CAM_PITCH_DEG = 12.7   # positive = tilting UP (horizon moves below image center)
+                        # calibrated 2026-05-20: reported 0.68m vs actual 2.204m → 12.7°
+
+
+def _ground_plane_dist(y2_px, img_h,
+                        cam_h=None, pitch_deg=None, fy=FOCAL_PX):
+    """Estimate horizontal distance to an object whose base touches the floor.
+
+    Camera tilted UP by pitch_deg: the geometric horizon appears BELOW image
+    centre (y_horizon > cy). Distance is inversely proportional to how far
+    y2 (bbox bottom = object's ground contact point) falls below the horizon.
+    """
+    import math
+    if cam_h is None:
+        cam_h = CAM_HEIGHT_M
+    if pitch_deg is None:
+        pitch_deg = CAM_PITCH_DEG
+    cy        = img_h / 2.0
+    y_horizon = cy + fy * math.tan(math.radians(pitch_deg))
+    y_below   = y2_px - y_horizon
+    if y_below < 10:   # base near / above horizon → object too far or bad bbox
+        return None
+    return cam_h * fy / y_below
 
 _COLOR_HSV = {
     'red':    [((0,   30, 40), (10,  255, 255)),
@@ -356,7 +383,8 @@ class PipelineNode(Node):
         if (s.startswith('ARRIVED') or
                 s.startswith('ERROR: Target lost') or
                 s.startswith('ERROR: Could not find') or
-                s.startswith('ERROR: Obstacle')):
+                s.startswith('ERROR: Obstacle') or
+                s.startswith('ERROR: Collision')):
             self.navigating = False
             self.target = None
             with self._det_lock:
@@ -455,14 +483,22 @@ class PipelineNode(Node):
                     self.get_logger().info(
                         f'[LATENCY] Depth estimation: {_depth_ms:.0f}ms')
                     x1,y1,x2,y2 = [int(v) for v in b]
-                    bbox_w_px    = x2 - x1
-                    rough_dist   = (TARGET_WIDTH_M * FOCAL_PX) / bbox_w_px \
-                        if bbox_w_px > 0 else 1.0
-                    cx_i = max(15, min(depth_map.shape[1]-15, (x1+x2)//2))
-                    cy_i = max(15, min(depth_map.shape[0]-15, (y1+b[3])//2 if len(b)>3 else (y1+y2)//2))
-                    roi  = depth_map[cy_i-15:cy_i+15, cx_i-15:cx_i+15]
-                    med  = float(np.median(roi))
-                    result['distance_m'] = round(med * (rough_dist/(med+1e-6)), 2)
+                    ih           = pil.size[1]
+                    gp_dist      = _ground_plane_dist(y2, ih)
+                    if gp_dist is not None:
+                        result['distance_m'] = round(gp_dist, 2)
+                        result['dist_method'] = 'ground_plane'
+                    else:
+                        # Fallback: width-based pinhole scaled by relative depth
+                        bbox_w_px = x2 - x1
+                        rough_dist = (TARGET_WIDTH_M * FOCAL_PX) / bbox_w_px \
+                            if bbox_w_px > 0 else 1.0
+                        cx_i = max(15, min(depth_map.shape[1]-15, (x1+x2)//2))
+                        cy_i = max(15, min(depth_map.shape[0]-15, (y1+y2)//2))
+                        roi  = depth_map[cy_i-15:cy_i+15, cx_i-15:cx_i+15]
+                        med  = float(np.median(roi))
+                        result['distance_m'] = round(med * (rough_dist/(med+1e-6)), 2)
+                        result['dist_method'] = 'pinhole_width'
                 except Exception as e:
                     self.get_logger().warn(f'[DEPTH] failed: {e}')
             else:
