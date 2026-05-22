@@ -61,6 +61,7 @@ class NavigationNode(Node):
     # Stop conditions
     STOP_AREA_RATIO      = 0.35   # stop when bbox covers 35% of image
     STOP_AREA_MIN_SCORE  = 0.60   # area-based stop requires this confidence
+    AREA_STOP_MAX_DISTANCE = 0.80 # area stop only counts when depth also says close
     CLOSE_RANGE_AREA     = 0.20   # target is visually close even if depth is noisy
     BBOX_BOTTOM_STOP_RATIO = 0.92 # stop if bbox bottom is near image bottom
     CLOSE_RANGE_DEPTH    = 1.20   # after this, target identity may become partial
@@ -94,6 +95,7 @@ class NavigationNode(Node):
     DETECTION_TIMEOUT = 4.0   # seconds
     SEARCH_TIMEOUT    = 25.0  # seconds without detection before stopping
     SEARCH_ANGULAR    = 0.20  # rad/s, enough to scan most of a room before timeout
+    FIRST_DETECTION_WAIT_S = 1.5  # wait briefly before rotating; DINO is slower than control loop
     CLOSE_RANGE_LOST_STOP_S = 2.5  # DINO is ~0.5 Hz; stop if close target misses a frame
     FOCAL_PX         = 644.69
     ARRIVE_THRESHOLD = 0.40
@@ -114,6 +116,7 @@ class NavigationNode(Node):
     STATE_DIRECT         = 'direct'
     STATE_CLOSE_LOST     = 'close_lost'
     STATE_LOCKED_MEMORY  = 'locked_memory'
+    STATE_WAITING_FIRST_DETECTION = 'waiting_first_detection'
     STATE_SEARCHING      = 'searching'
     STATE_TRACKING       = 'tracking'
 
@@ -139,6 +142,7 @@ class NavigationNode(Node):
         self.target_world_pos   = None
         self.target_dist        = None
         self._nav_start_wall    = None
+        self._wait_logged       = False
         self._search_start_wall = None
         self._ever_detected     = False
         # Dead-reckoning stop (used when odometry unavailable but depth available)
@@ -190,6 +194,7 @@ class NavigationNode(Node):
             self._direct_cmd        = (lin, ang)
             self._last_control_time = None
             self._nav_start_wall    = time.time()
+            self._wait_logged        = False
             self._search_start_wall = None
             self._ever_detected     = False
             self._dr_dist           = None
@@ -220,6 +225,7 @@ class NavigationNode(Node):
         self.start_pose         = self.current_pose
         self._last_control_time = None
         self._nav_start_wall    = time.time()
+        self._wait_logged       = False
         self._search_start_wall = None
         self._ever_detected     = False
         self._dr_dist           = None
@@ -289,9 +295,13 @@ class NavigationNode(Node):
                             f'area={area_ratio:.2f}  bottom={bottom_ratio:.2f}')
                     self._close_range_seen = True
 
-                if (area_ratio >= self.STOP_AREA_RATIO and score >= self.STOP_AREA_MIN_SCORE):
+                if (area_ratio >= self.STOP_AREA_RATIO
+                        and dist_m
+                        and dist_m <= self.AREA_STOP_MAX_DISTANCE
+                        and score >= self.STOP_AREA_MIN_SCORE):
                     self.get_logger().info(
-                        f'[VISUAL_ARRIVED] area={area_ratio:.2f} >= {self.STOP_AREA_RATIO:.2f}')
+                        f'[VISUAL_ARRIVED] area={area_ratio:.2f} >= {self.STOP_AREA_RATIO:.2f} '
+                        f'and dist={dist_m:.2f}m <= {self.AREA_STOP_MAX_DISTANCE:.2f}m')
                     self._visual_arrived = True
                 elif (bottom_ratio >= self.BBOX_BOTTOM_STOP_RATIO
                         and self._close_range_seen
@@ -458,6 +468,15 @@ class NavigationNode(Node):
             self.stop_robot('arrived')
             return
 
+        if state == self.STATE_WAITING_FIRST_DETECTION:
+            if not self._wait_logged:
+                self.get_logger().info(
+                    f'[WAIT_FIRST_DETECTION] holding still for "{self.target}" before SEARCH')
+                self._publish_status(f'NAVIGATING: Checking current view for "{self.target}"')
+                self._wait_logged = True
+            self.pub_cmd_vel.publish(Twist())
+            return
+
         # If the target was detected earlier with depth, keep a short spatial
         # memory only after fresh vision has dropped out. While the target is
         # visible, visual servoing below remains the primary "am I there yet?"
@@ -512,16 +531,21 @@ class NavigationNode(Node):
         image_width  = self.detection.get('image_width',  self.IMAGE_WIDTH)
         image_height = self.detection.get('image_height', self.IMAGE_HEIGHT)
         score        = self.detection.get('score', 0.0)
+        dist_m       = self.detection.get('distance_m', None)
 
         box_area   = (box[2] - box[0]) * (box[3] - box[1])
         image_area = image_width * image_height
         area_ratio = box_area / image_area if image_area > 0 else 0
 
-        # Area-based safety stop: if the target visually fills the frame,
-        # stop even if depth is noisy or unavailable.
-        if area_ratio > self.STOP_AREA_RATIO and score >= self.STOP_AREA_MIN_SCORE:
+        # Area is only a supporting cue. With the low PuzzleBot camera, tall
+        # objects such as chairs can fill the image while still being far away.
+        if (area_ratio > self.STOP_AREA_RATIO
+                and dist_m
+                and dist_m <= self.AREA_STOP_MAX_DISTANCE
+                and score >= self.STOP_AREA_MIN_SCORE):
             self.get_logger().info(
-                f'Reached "{self.target}"!  area={area_ratio:.2f}  score={score:.2f}')
+                f'Reached "{self.target}"!  area={area_ratio:.2f}  '
+                f'dist={dist_m:.2f}m  score={score:.2f}')
             self.stop_robot('success')
             return
 
@@ -593,25 +617,47 @@ class NavigationNode(Node):
 
     def stop_robot(self, reason: str = 'stop'):
         stopped_target = self.target
+        final_dist = None
+        if isinstance(self.detection, dict):
+            try:
+                final_dist = float(self.detection.get('distance_m'))
+            except (TypeError, ValueError):
+                final_dist = None
+        nav_ms = None
         if self._nav_start_wall and self.navigating:
             nav_ms = (time.time() - self._nav_start_wall) * 1000
             self.get_logger().info(
                 f'[LATENCY] Navigation total: {nav_ms:.0f}ms  reason={reason}')
+        final_dist_text = f'{final_dist:.2f}' if final_dist is not None else 'NA'
+        nav_ms_text = f'{nav_ms:.0f}' if nav_ms is not None else 'NA'
+        self.get_logger().info(
+            f'[TRIAL_NAV_RESULT] target="{stopped_target}" reason={reason} '
+            f'nav_ms={nav_ms_text} final_dist_m={final_dist_text}')
         self.get_logger().info(f'[CMD_VEL] STOP  reason={reason}')
         self.pub_cmd_vel.publish(Twist())
         if reason == 'arrived' or reason == 'success':
-            self._publish_status('ARRIVED: I have arrived and stopped.')
+            if nav_ms is not None:
+                dist_suffix = f' final_dist_m={final_dist:.2f}' if final_dist is not None else ''
+                self._publish_status(
+                    f'ARRIVED: I have arrived and stopped. nav_ms={nav_ms:.0f} reason={reason}{dist_suffix}')
+            else:
+                self._publish_status('ARRIVED: I have arrived and stopped.')
         elif reason == 'target_lost':
             self._publish_status(
-                f'ERROR: Target lost -- I lost sight of "{stopped_target}". I saw it before, but I cannot see it now.')
+                f'ERROR: Target lost -- I lost sight of "{stopped_target}". I saw it before, but I cannot see it now.'
+                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
         elif reason == 'search_timeout':
             self._publish_status(
-                f'ERROR: Could not find -- I could not find "{stopped_target}", so I stopped.')
+                f'ERROR: Could not find -- I could not find "{stopped_target}", so I stopped.'
+                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
         elif reason == 'collision':
             self._publish_status(
-                f'ERROR: Collision detected -- I may have bumped into something or got stuck, so I stopped.')
+                'ERROR: Collision detected -- I may have bumped into something or got stuck, so I stopped.'
+                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
         elif reason == 'obstacle_stop':
-            self._publish_status('ERROR: Obstacle detected -- There is something in front of me, so I stopped.')
+            self._publish_status(
+                'ERROR: Obstacle detected -- There is something in front of me, so I stopped.'
+                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
         elif reason == 'command_stop':
             self._publish_status('STOPPED: Okay, I have stopped.')
         self.navigating  = False
@@ -619,6 +665,7 @@ class NavigationNode(Node):
         self._direct_cmd = None
         self.target_world_pos = None
         self.target_dist      = None
+        self._wait_logged       = False
         self._search_start_wall = None
         self._ever_detected     = False
         self._dr_dist      = None
@@ -693,6 +740,14 @@ class NavigationNode(Node):
             return {
                 'state': self.STATE_LOCKED_MEMORY,
                 'reason': 'temporarily using remembered target position',
+            }
+
+        if (not self._ever_detected
+                and self._nav_start_wall is not None
+                and time.time() - self._nav_start_wall < self.FIRST_DETECTION_WAIT_S):
+            return {
+                'state': self.STATE_WAITING_FIRST_DETECTION,
+                'reason': 'waiting for first perception result',
             }
 
         if not detection_valid:

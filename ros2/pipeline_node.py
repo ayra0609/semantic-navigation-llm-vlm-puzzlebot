@@ -25,6 +25,7 @@ Both modes:
 
 import sys
 import os
+import re
 import threading
 import numpy as np
 import cv2
@@ -167,6 +168,7 @@ class PipelineNode(Node):
         self._odom_log_time  = 0.0
         self._smooth_cx      = None
         self._last_frame_ts  = 0.0
+        self._trial_metrics  = None
 
         # Stop-retry: after a stop command publish empty string 3 more times
         # (200 ms apart) to survive DDS packet loss between Humble and Foxy
@@ -306,12 +308,34 @@ class PipelineNode(Node):
         # Tier 3: NAVIGATE TO X (LLM + DINO)
         self.get_logger().info(f'Command: "{user_input}"')
         self._publish_status(f'PROCESSING: "{user_input}"')
+        self._trial_metrics = {
+            'command': user_input,
+            'target': None,
+            'command_wall': None,
+            'first_nav_target_wall': None,
+            'intent_ms': None,
+            'conversion_ms': None,
+            'first_dino_ms': None,
+            'first_depth_ms': None,
+            'first_perception_ms': None,
+            'first_network_total_ms': None,
+            'last_dino_ms': None,
+            'last_depth_ms': None,
+            'last_perception_ms': None,
+            'last_network_total_ms': None,
+            'perception_count': 0,
+            'dino_sum_ms': 0.0,
+            'depth_sum_ms': 0.0,
+            'network_sum_ms': 0.0,
+        }
 
         try:
             import time as _time
             _t0 = _time.time()
+            self._trial_metrics['command_wall'] = _t0
             result = extract_navigation_intent(user_input)
             _llm_ms = (_time.time() - _t0) * 1000
+            self._trial_metrics['intent_ms'] = _llm_ms
             self.get_logger().info(
                 f'[LATENCY] LLM intent extraction: {_llm_ms:.0f}ms')
         except Exception as e:
@@ -322,10 +346,13 @@ class PipelineNode(Node):
         self.get_logger().info(f'[LLM] result={result}')
 
         if result and result.get('action') == 'navigate_to':
+            _conv_t0 = _time.time()
             self.target          = result['target']
             self.navigating      = True
             self._nav_start_time = self.get_clock().now()
             self._smooth_cx      = None
+            if self._trial_metrics is not None:
+                self._trial_metrics['target'] = self.target
             with self._det_lock:
                 self._detection = None
             self.get_logger().info(
@@ -334,7 +361,18 @@ class PipelineNode(Node):
             if not self.sim_mode:
                 m = String(); m.data = self.target
                 self.pub_target.publish(m)
+                _pub_wall = _time.time()
+                if self._trial_metrics is not None:
+                    self._trial_metrics['first_nav_target_wall'] = _pub_wall
+                    self._trial_metrics['conversion_ms'] = (_pub_wall - _conv_t0) * 1000
                 self.get_logger().info(f'[PUB] /nav_target "{self.target}"')
+                self.get_logger().info(
+                    f'[LATENCY] Conversion/dispatch: {(_pub_wall - _conv_t0) * 1000:.0f}ms')
+            else:
+                _conv_ms = (_time.time() - _conv_t0) * 1000
+                if self._trial_metrics is not None:
+                    self._trial_metrics['conversion_ms'] = _conv_ms
+                self.get_logger().info(f'[LATENCY] Conversion/dispatch: {_conv_ms:.0f}ms')
         else:
             self.get_logger().warn(f'[LLM] unrecognised result: {result}')
             self._publish_status(f'ERROR: Could not parse "{user_input}"')
@@ -377,19 +415,110 @@ class PipelineNode(Node):
             f'[ODOM] pos=({x:.3f},{y:.3f})  vel=(lin={vx:.3f},ang={wz:.3f})')
 
     def _on_nav_status(self, msg: String):
-        if not self.navigating:
-            return
         s = msg.data
-        if (s.startswith('ARRIVED') or
-                s.startswith('ERROR: Target lost') or
-                s.startswith('ERROR: Could not find') or
-                s.startswith('ERROR: Obstacle') or
-                s.startswith('ERROR: Collision')):
+        ended = (
+            s.startswith('ARRIVED') or
+            s.startswith('ERROR: Target lost') or
+            s.startswith('ERROR: Could not find') or
+            s.startswith('ERROR: Obstacle') or
+            s.startswith('ERROR: Collision')
+        )
+        if not self.navigating and not (ended and self._trial_metrics is not None):
+            return
+        if ended:
+            self.get_logger().info(f'[NAV_STATUS_RAW] {s}')
+            self._log_trial_metrics(s)
             self.navigating = False
             self.target = None
             with self._det_lock:
                 self._detection = None
             self.get_logger().info(f'[NAV_STATUS] navigation ended: {s[:60]}')
+
+    def _record_perception_latency(self, dino_ms: float, depth_ms: float, network_total_ms: float):
+        if self._trial_metrics is None:
+            return
+        perception_ms = dino_ms + depth_ms
+        with self._det_lock:
+            tm = self._trial_metrics
+            if tm is None:
+                return
+            if tm['first_dino_ms'] is None:
+                tm['first_dino_ms'] = dino_ms
+                tm['first_depth_ms'] = depth_ms
+                tm['first_perception_ms'] = perception_ms
+                tm['first_network_total_ms'] = network_total_ms
+            tm['last_dino_ms'] = dino_ms
+            tm['last_depth_ms'] = depth_ms
+            tm['last_perception_ms'] = perception_ms
+            tm['last_network_total_ms'] = network_total_ms
+            tm['perception_count'] += 1
+            tm['dino_sum_ms'] += dino_ms
+            tm['depth_sum_ms'] += depth_ms
+            tm['network_sum_ms'] += network_total_ms
+
+    def _log_trial_metrics(self, nav_status: str):
+        if self._trial_metrics is None:
+            return
+        import time as _time
+        with self._det_lock:
+            tm = dict(self._trial_metrics)
+            self._trial_metrics = None
+
+        def fmt_ms(value):
+            return f'{value:.0f}' if value is not None else 'NA'
+
+        nav_match = re.search(r'\bnav_ms=([0-9.]+)', nav_status)
+        final_dist_match = re.search(r'\bfinal_dist_m=([0-9.]+)', nav_status)
+        nav_reported_ms = float(nav_match.group(1)) if nav_match else None
+        final_dist_m = float(final_dist_match.group(1)) if final_dist_match else None
+        local_actuation_ms = None
+        if tm.get('first_nav_target_wall') is not None:
+            local_actuation_ms = (_time.time() - tm['first_nav_target_wall']) * 1000
+        actuation_ms = nav_reported_ms if nav_reported_ms is not None else local_actuation_ms
+        total_e2e_ms = None
+        if tm.get('command_wall') is not None:
+            total_e2e_ms = (_time.time() - tm['command_wall']) * 1000
+
+        count = tm.get('perception_count', 0)
+        mean_dino_ms = tm['dino_sum_ms'] / count if count else None
+        mean_depth_ms = tm['depth_sum_ms'] / count if count else None
+        mean_network_ms = tm['network_sum_ms'] / count if count else None
+        mean_perception_ms = (
+            mean_dino_ms + mean_depth_ms
+            if mean_dino_ms is not None and mean_depth_ms is not None
+            else None
+        )
+
+        outcome = 'ARRIVED' if nav_status.startswith('ARRIVED') else 'ERROR'
+        final_dist_text = f'{final_dist_m:.2f}' if final_dist_m is not None else 'NA'
+        log_line = (
+            '[TRIAL_METRICS] '
+            f'command="{tm.get("command","")}" '
+            f'target="{tm.get("target","")}" '
+            f'outcome={outcome} '
+            f'intent_ms={fmt_ms(tm.get("intent_ms"))} '
+            f'conversion_ms={fmt_ms(tm.get("conversion_ms"))} '
+            f'first_dino_ms={fmt_ms(tm.get("first_dino_ms"))} '
+            f'first_depth_ms={fmt_ms(tm.get("first_depth_ms"))} '
+            f'first_perception_ms={fmt_ms(tm.get("first_perception_ms"))} '
+            f'first_network_total_ms={fmt_ms(tm.get("first_network_total_ms"))} '
+            f'mean_dino_ms={fmt_ms(mean_dino_ms)} '
+            f'mean_depth_ms={fmt_ms(mean_depth_ms)} '
+            f'mean_perception_ms={fmt_ms(mean_perception_ms)} '
+            f'mean_network_total_ms={fmt_ms(mean_network_ms)} '
+            f'perception_frames={count} '
+            f'actuation_ms={fmt_ms(actuation_ms)} '
+            f'nav_reported_ms={fmt_ms(nav_reported_ms)} '
+            f'total_e2e_ms={fmt_ms(total_e2e_ms)} '
+            f'final_dist_m={final_dist_text}'
+        )
+        self.get_logger().info(log_line)
+        self.get_logger().info(
+            '[TRIAL_TABLE] '
+            f'LLM_ms={fmt_ms(tm.get("intent_ms"))} '
+            f'DINO_ms={fmt_ms(tm.get("first_dino_ms"))} '
+            f'Depth_ms={fmt_ms(tm.get("first_depth_ms"))} '
+            f'NavTotal_ms={fmt_ms(actuation_ms)}')
 
     # -------------------------------------------------------------------------
     # Detection loop (0.5 Hz)
@@ -449,6 +578,9 @@ class PipelineNode(Node):
                 total_ms = (_time.time() - _t0) * 1000
                 result = resp.json()
                 if result.get('found'):
+                    dino_ms = float(result.get('dino_ms', 0) or 0)
+                    depth_ms = float(result.get('depth_ms', 0) or 0)
+                    self._record_perception_latency(dino_ms, depth_ms, total_ms)
                     self.get_logger().info(
                         f'[DINO] found=True  score={result["score"]:.2f}'
                         f'  cx={result.get("center_x",0):.0f}'
@@ -482,6 +614,7 @@ class PipelineNode(Node):
                     _depth_ms    = (_time.time() - _t1) * 1000
                     self.get_logger().info(
                         f'[LATENCY] Depth estimation: {_depth_ms:.0f}ms')
+                    self._record_perception_latency(_dino_ms, _depth_ms, _dino_ms + _depth_ms)
                     x1,y1,x2,y2 = [int(v) for v in b]
                     ih           = pil.size[1]
                     gp_dist      = _ground_plane_dist(y2, ih)

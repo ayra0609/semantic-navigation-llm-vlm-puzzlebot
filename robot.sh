@@ -35,6 +35,7 @@ SESSION="puzzlebot_robot"
 LOGDIR="$PROJECT_ROOT/project_log"
 mkdir -p "$LOGDIR"
 LOGFILE="$LOGDIR/$(date +%Y%m%d%H%M).log"
+SORTED_LOGFILE="$LOGFILE"
 
 JETSON_IP="${1:-100.112.165.86}"
 JETSON_USER="jetson"
@@ -56,11 +57,42 @@ unset RMW_IMPLEMENTATION
 export FASTRTPS_DEFAULT_PROFILES_FILE="$PROJECT_ROOT/fastdds_tailscale.xml"
 export RCUTILS_COLORIZED_OUTPUT=0
 
+sort_log_by_ros_time() {
+  local src="$1"
+  local dst="$2"
+
+  [[ -s "$src" ]] || return 0
+  python3 - "$src" "$dst" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+ts_re = re.compile(r"\[(\d{9,}(?:\.\d+)?)\]")
+
+rows = []
+for idx, line in enumerate(src.read_text(errors="replace").splitlines(True)):
+    match = ts_re.search(line)
+    ts = float(match.group(1)) if match else float("inf")
+    rows.append((ts, idx, line))
+
+rows.sort(key=lambda item: (item[0], item[1]))
+dst.write_text("".join(line for _, _, line in rows))
+PY
+}
+
 cleanup() {
   warn "Shutting down…"
   # Kill SSH tunnel if running
   pkill -f "ssh.*-L ${NCC_PORT}:.*:${NCC_PORT}.*${NCC_HOST}" 2>/dev/null || true
   tmux kill-session -t "$SESSION" 2>/dev/null || true
+  sleep 0.2
+  if sort_log_by_ros_time "$LOGFILE" "$SORTED_LOGFILE"; then
+    ok "Sorted log: $SORTED_LOGFILE"
+  else
+    warn "Could not write sorted log: $SORTED_LOGFILE"
+  fi
   ok "Stopped. Bye!"
 }
 trap cleanup EXIT INT TERM
@@ -143,6 +175,7 @@ info "NCC Host:   ${NCC_HOST}  (${NCC_GRES}, port ${NCC_PORT})"
 info "RMW:        ${RMW_IMPLEMENTATION}"
 ok "All checks passed."
 info "Log  →  $LOGFILE"
+info "Log will be sorted by ROS timestamp on shutdown."
 
 # ════════════════════════════════════════════════════════════════
 section "Launching pipeline"
