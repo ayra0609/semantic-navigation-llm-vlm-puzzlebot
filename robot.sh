@@ -163,9 +163,9 @@ fi
 # Ollama
 if command -v ollama &>/dev/null; then
   pgrep -x ollama &>/dev/null || { ollama serve &>/dev/null & sleep 2; }
-  ollama list 2>/dev/null | grep -q mistral \
-    && ok "Ollama + Mistral ready" \
-    || warn "Mistral not found — regex fallback active"
+  ollama list 2>/dev/null | grep -q 'qwen2.5:0.5b' \
+    && ok "Ollama + Qwen ready" \
+    || warn "Qwen not found — run: ollama pull qwen2.5:0.5b"
 else
   warn "Ollama not installed — regex fallback active"
 fi
@@ -226,7 +226,7 @@ tmux send-keys -t "$SESSION:0.3" \
 
 # ── PANE 4: SSH → Jetson navigation_node (auto-restart on crash) ─
 tmux send-keys -t "$SESSION:0.4" \
-  "echo -e '\033[1;36m[PANE 4] Jetson navigation_node…\033[0m' && sleep 5 && ssh -t $SSH_OPTS ${JETSON_USER}@${JETSON_IP} '${JENV} && echo [JETSON] navigation_node starting && until python3 ros2/navigation_node.py; do echo [JETSON] nav_node crashed, restarting in 3s...; sleep 3; done' 2>&1 | $STRIP_ANSI | awk '{print \"[nav_node] \" \$0; fflush()}' | tee -a $LOGFILE" \
+  "echo -e '\033[1;36m[PANE 4] Jetson navigation_node\033[0m' && sleep 5 && ssh -t $SSH_OPTS ${JETSON_USER}@${JETSON_IP} '${JENV} && (echo [JETSON] navigation_node starting && until python3 ros2/navigation_node.py; do echo [JETSON] nav_node crashed, restarting in 3s...; sleep 3; done)' 2>&1 | $STRIP_ANSI | awk '{print \"[nav_node] \" \$0; fflush()}' | tee -a $LOGFILE" \
   Enter
 
 # ── PANE 5: SSH → NCC GPU inference server ───────────────────────
