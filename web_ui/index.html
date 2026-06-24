@@ -380,20 +380,21 @@ function fmtStatus(s) {
   if (s.startsWith('PROCESSING'))           return 'I am understanding your command.';
   if (s.includes('Waiting for camera'))     return 'I am waiting for the camera feed.';
   if (s.includes('Loading VLM'))            return 'I am loading the vision model.';
-  if (s.includes('Target detected') || s.includes('detected')) {
+  if (s.startsWith('ERROR: Target lost'))   return 'I lost the target. I saw it before, but I cannot see it now.';
+  if (s.startsWith('ERROR: Could not find')) return 'I could not find the target, so I stopped.';
+  if (s.startsWith('ERROR: Obstacle'))      return 'There is something in front of me, so I stopped.';
+  if (s.startsWith('ERROR: Encoder feedback lost')) return 'I lost wheel feedback, so I stopped for safety.';
+  if (s.startsWith('ERROR: Collision'))     return 'I may have bumped into something or got stuck, so I stopped.';
+  if (s.startsWith('ERROR'))                return s.replace(/^ERROR:\s*/, '');
+  if (s.includes('Target locked'))          return 'I have remembered the target position and I am moving closer.';
+  if (s.includes('Target detected')) {
     return 'I can see the target. I am moving closer.';
   }
-  if (s.includes('Target locked'))          return 'I have remembered the target position and I am moving closer.';
   if (s.startsWith('NAVIGATING: Heading')) {
     const m = s.match(/Heading to "(.+)"/);
     return m ? 'I am going to look for ' + m[1] + '.' : 'I am ready to move.';
   }
   if (s.startsWith('NAVIGATING'))           return 'I am looking for the target.';
-  if (s.startsWith('ERROR: Target lost'))   return 'I lost the target. I saw it before, but I cannot see it now.';
-  if (s.startsWith('ERROR: Could not find')) return 'I could not find the target, so I stopped.';
-  if (s.startsWith('ERROR: Obstacle'))      return 'There is something in front of me, so I stopped.';
-  if (s.startsWith('ERROR: Collision'))     return 'I may have bumped into something or got stuck, so I stopped.';
-  if (s.startsWith('ERROR'))                return s.replace(/^ERROR:\s*/, '');
   return s;
 }
 

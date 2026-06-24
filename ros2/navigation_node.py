@@ -83,10 +83,20 @@ class NavigationNode(Node):
     # it detects "I am commanding motion, but the robot is not actually moving".
     COLLISION_DETECTION       = True
     COLLISION_CHECK_WINDOW_S  = 1.8
-    COLLISION_MIN_LINEAR_CMD  = 0.06
+    COLLISION_MIN_LINEAR_CMD  = 0.04
     COLLISION_MIN_ANGULAR_CMD = 0.18
     COLLISION_MIN_TRANSLATION = 0.025
     COLLISION_MIN_ROTATION    = 0.08
+    ODOM_STALE_MOTION_STOP_S  = 3.0
+    NO_PROGRESS_TIMEOUT_S     = 10.0
+    NO_PROGRESS_MIN_LINEAR_CMD = 0.04
+    NO_PROGRESS_MIN_DIST_DROP_M = 0.20
+    NO_PROGRESS_MIN_AREA_GAIN = 0.04
+    EDGE_STUCK_TIMEOUT_S      = 6.0
+    EDGE_STUCK_MARGIN_PX      = 80
+    EDGE_STUCK_MIN_ERROR_PX   = 220
+    PERCEPTION_RISK_TIMEOUT_S = 6.0
+    PERCEPTION_RISK_THRESHOLD = 0.60
 
     # Detection hysteresis
     # How long (s) to keep using the last positive detection before switching
@@ -95,8 +105,9 @@ class NavigationNode(Node):
     DETECTION_TIMEOUT = 4.0   # seconds
     SEARCH_TIMEOUT    = 25.0  # seconds without detection before stopping
     SEARCH_ANGULAR    = 0.20  # rad/s, enough to scan most of a room before timeout
-    FIRST_DETECTION_WAIT_S = 1.5  # wait briefly before rotating; DINO is slower than control loop
+    FIRST_DETECTION_WAIT_S = 15.0  # wait for slow NCC/VLM startup before rotating
     CLOSE_RANGE_LOST_STOP_S = 2.5  # DINO is ~0.5 Hz; stop if close target misses a frame
+    NCC_UNAVAILABLE_TIMEOUT_S = 15.0  # report failure if NCC stays unavailable this long
     FOCAL_PX         = 644.69
     ARRIVE_THRESHOLD = 0.40
     # Direct-motion speeds
@@ -116,6 +127,8 @@ class NavigationNode(Node):
     STATE_DIRECT         = 'direct'
     STATE_CLOSE_LOST     = 'close_lost'
     STATE_LOCKED_MEMORY  = 'locked_memory'
+    STATE_NCC_UNAVAILABLE_WAIT = 'ncc_unavailable_wait'
+    STATE_NCC_UNAVAILABLE_STOP = 'ncc_unavailable_stop'
     STATE_WAITING_FIRST_DETECTION = 'waiting_first_detection'
     STATE_SEARCHING      = 'searching'
     STATE_TRACKING       = 'tracking'
@@ -138,9 +151,11 @@ class NavigationNode(Node):
         self.navigating           = False
         self.start_pose           = None
         self.current_pose         = None
+        self._odom_encoder_fresh  = False
         self.current_yaw        = 0.0
         self.target_world_pos   = None
         self.target_dist        = None
+        self._last_fresh_odom_wall = None
         self._nav_start_wall    = None
         self._wait_logged       = False
         self._search_start_wall = None
@@ -154,8 +169,21 @@ class NavigationNode(Node):
         self._dist_arrived = False  # set when live depth reading reaches DIST_STOP_DISTANCE
         self._visual_arrived = False
         self._close_range_seen = False
+        self._ncc_unavailable_since = None
+        self._ncc_unavailable_last = None
         self._collision_ref_pose = None
         self._collision_ref_time = None
+        self._odom_stale_motion_since = None
+        self._progress_ref_time = None
+        self._progress_ref_dist = None
+        self._progress_ref_area = None
+        self._edge_stuck_since = None
+        self._edge_stuck_last_dist = None
+        self._perception_risk_since = None
+        self._last_perception_risk_log = 0.0
+        self._last_cmd_linear = 0.0
+        self._last_cmd_angular = 0.0
+        self._collision_stop_reason = 'collision'
         # Subscribers
         self.create_subscription(String,   '/nav_target',       self.target_callback,    10)
         self.create_subscription(String,   '/detection_result', self.detection_callback, 10)
@@ -205,6 +233,8 @@ class NavigationNode(Node):
             self._dist_arrived      = False
             self._visual_arrived    = False
             self._close_range_seen  = False
+            self._ncc_unavailable_since = None
+            self._ncc_unavailable_last = None
             self._reset_collision_watchdog()
             self.pid.reset()
             self.get_logger().info(f'[NAV_TARGET] new goal "{self.target}"')
@@ -236,6 +266,8 @@ class NavigationNode(Node):
         self._dist_arrived      = False
         self._visual_arrived    = False
         self._close_range_seen  = False
+        self._ncc_unavailable_since = None
+        self._ncc_unavailable_last = None
         self._reset_collision_watchdog()
         self.pid.reset()
         self.get_logger().info(f'[NAV_TARGET] new goal "{self.target}"')
@@ -250,11 +282,23 @@ class NavigationNode(Node):
             found = data.get('found', False)
             score = data.get('score', 0.0)
 
+            if data.get('ncc_unavailable') or data.get('vlm_unavailable'):
+                now = time.time()
+                if self._ncc_unavailable_since is None:
+                    self._ncc_unavailable_since = self._nav_start_wall or now
+                    self._publish_status('WAITING: NCC unavailable, holding still')
+                self._ncc_unavailable_last = now
+                self.get_logger().warn(
+                    f'[NCC_UNAVAILABLE] holding still; error={data.get("error", "?")}')
+                return
+
             if found and score >= self.MIN_DETECTION_SCORE:
                 # Positive detection: accept and refresh timestamp
                 self.detection            = data
                 self._last_detection_time = time.time()
                 self._search_start_wall   = None
+                self._ncc_unavailable_since = None
+                self._ncc_unavailable_last = None
                 if not self._ever_detected:
                     self._publish_status(f'NAVIGATING: Target detected "{self.target}"')
                 self._ever_detected       = True
@@ -310,6 +354,25 @@ class NavigationNode(Node):
                         f'[VISUAL_ARRIVED] bbox_bottom={bottom_ratio:.2f} '
                         f'>= {self.BBOX_BOTTOM_STOP_RATIO:.2f}')
                     self._visual_arrived = True
+
+                if self._no_progress_detected(dist_m, area_ratio):
+                    self.get_logger().warn(
+                        '[NO_PROGRESS] commanded forward motion but target distance/area did not improve')
+                    self.stop_robot('collision')
+                    return
+
+                if self._edge_stuck_detected(data, dist_m):
+                    self.get_logger().warn(
+                        '[EDGE_STUCK] target stayed at image edge while robot kept moving')
+                    self.stop_robot('collision')
+                    return
+
+                if self._perception_collision_risk_detected(
+                        data, dist_m, area_ratio, bottom_ratio):
+                    self.get_logger().warn(
+                        '[PERCEPTION_RISK] pretrained visual/depth cues indicate collision risk')
+                    self.stop_robot('collision')
+                    return
 
                 # Update dead-reckoning estimate (high-confidence detections only).
                 # Total distance can only decrease — prevents inflated estimates from
@@ -389,6 +452,8 @@ class NavigationNode(Node):
                         f'[TARGET_LOCKED] world=({self.target_world_pos[0]:.2f},'
                         f'{self.target_world_pos[1]:.2f})  dist={dist_m:.2f}m')
             else:
+                self._ncc_unavailable_since = None
+                self._ncc_unavailable_last = None
                 # Not-found or low score: only overwrite after timeout.
                 # This prevents a single missed DINO frame from immediately
                 # spinning the robot into SEARCH mode.
@@ -413,6 +478,14 @@ class NavigationNode(Node):
         self.lidar_distance = min(valid) if valid else float('inf')
 
     def odom_callback(self, msg):
+        encoder_fresh = msg.pose.covariance[0] >= 0.0
+        now = time.time()
+        if not encoder_fresh and self._last_fresh_odom_wall is not None:
+            if now - self._last_fresh_odom_wall < 1.0:
+                return
+        self._odom_encoder_fresh = encoder_fresh
+        if encoder_fresh:
+            self._last_fresh_odom_wall = now
         pos = msg.pose.pose.position
         self.current_pose = (pos.x, pos.y)
 
@@ -449,6 +522,18 @@ class NavigationNode(Node):
             self.get_logger().info(
                 f'Obstacle at {self.lidar_distance:.2f}m -- stopping!')
             self.stop_robot('obstacle_stop')
+            return
+
+        if state == self.STATE_NCC_UNAVAILABLE_STOP:
+            self.get_logger().warn(
+                f'[STATE] NCC unavailable -- {nav_state["reason"]}')
+            self.stop_robot('ncc_unavailable')
+            return
+
+        if state == self.STATE_NCC_UNAVAILABLE_WAIT:
+            self.get_logger().warn(
+                f'[NCC_UNAVAILABLE_WAIT] {nav_state["reason"]}')
+            self.pub_cmd_vel.publish(Twist())
             return
 
         # Direct motion command (__forward / __backward / __left / __right)
@@ -630,39 +715,48 @@ class NavigationNode(Node):
                 f'[LATENCY] Navigation total: {nav_ms:.0f}ms  reason={reason}')
         final_dist_text = f'{final_dist:.2f}' if final_dist is not None else 'NA'
         nav_ms_text = f'{nav_ms:.0f}' if nav_ms is not None else 'NA'
+        dist_suffix = f' final_dist_m={final_dist_text}' if final_dist is not None else ''
+        nav_suffix = f' nav_ms={nav_ms_text} reason={reason}{dist_suffix}' if nav_ms is not None else ''
+
+        if reason == 'arrived' or reason == 'success':
+            self._publish_status(
+                f'ARRIVED: I have arrived and stopped.{nav_suffix}'
+                if nav_ms is not None else 'ARRIVED: I have arrived and stopped.')
+        elif reason == 'target_lost':
+            self._publish_status(
+                f'ERROR: Target lost -- I lost sight of "{stopped_target}". I saw it before, but I cannot see it now.'
+                + nav_suffix)
+        elif reason == 'search_timeout':
+            self._publish_status(
+                f'ERROR: Could not find -- I could not find "{stopped_target}", so I stopped.'
+                + nav_suffix)
+        elif reason == 'collision':
+            self._publish_status(
+                'ERROR: Collision detected -- I may have bumped into something or got stuck, so I stopped.'
+                + nav_suffix)
+        elif reason == 'encoder_lost':
+            self._publish_status(
+                'ERROR: Encoder feedback lost -- I lost wheel encoder feedback while moving, so I stopped for safety.'
+                + nav_suffix)
+        elif reason == 'ncc_unavailable':
+            self._publish_status('ERROR: ncc unavailable' + nav_suffix)
+        elif reason == 'obstacle_stop':
+            self._publish_status(
+                'ERROR: Obstacle detected -- There is something in front of me, so I stopped.'
+                + nav_suffix)
+        elif reason == 'command_stop':
+            self._publish_status('STOPPED: Okay, I have stopped.')
+
         self.get_logger().info(
             f'[TRIAL_NAV_RESULT] target="{stopped_target}" reason={reason} '
             f'nav_ms={nav_ms_text} final_dist_m={final_dist_text}')
         self.get_logger().info(f'[CMD_VEL] STOP  reason={reason}')
         self.pub_cmd_vel.publish(Twist())
-        if reason == 'arrived' or reason == 'success':
-            if nav_ms is not None:
-                dist_suffix = f' final_dist_m={final_dist:.2f}' if final_dist is not None else ''
-                self._publish_status(
-                    f'ARRIVED: I have arrived and stopped. nav_ms={nav_ms:.0f} reason={reason}{dist_suffix}')
-            else:
-                self._publish_status('ARRIVED: I have arrived and stopped.')
-        elif reason == 'target_lost':
-            self._publish_status(
-                f'ERROR: Target lost -- I lost sight of "{stopped_target}". I saw it before, but I cannot see it now.'
-                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
-        elif reason == 'search_timeout':
-            self._publish_status(
-                f'ERROR: Could not find -- I could not find "{stopped_target}", so I stopped.'
-                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
-        elif reason == 'collision':
-            self._publish_status(
-                'ERROR: Collision detected -- I may have bumped into something or got stuck, so I stopped.'
-                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
-        elif reason == 'obstacle_stop':
-            self._publish_status(
-                'ERROR: Obstacle detected -- There is something in front of me, so I stopped.'
-                + (f' nav_ms={nav_ms:.0f} reason={reason}' if nav_ms is not None else ''))
-        elif reason == 'command_stop':
-            self._publish_status('STOPPED: Okay, I have stopped.')
         self.navigating  = False
         self.detection   = None
         self._direct_cmd = None
+        self._last_cmd_linear = 0.0
+        self._last_cmd_angular = 0.0
         self.target_world_pos = None
         self.target_dist      = None
         self._wait_logged       = False
@@ -676,6 +770,8 @@ class NavigationNode(Node):
         self._dist_arrived = False
         self._visual_arrived = False
         self._close_range_seen = False
+        self._ncc_unavailable_since = None
+        self._ncc_unavailable_last = None
         self._reset_collision_watchdog()
         self._log_result(reason)
         self.target = None
@@ -716,6 +812,18 @@ class NavigationNode(Node):
             return {
                 'state': self.STATE_DIRECT,
                 'reason': 'manual/direct motion command',
+            }
+
+        if self._ncc_unavailable_since is not None:
+            unavailable_age = time.time() - self._ncc_unavailable_since
+            if unavailable_age >= self.NCC_UNAVAILABLE_TIMEOUT_S:
+                return {
+                    'state': self.STATE_NCC_UNAVAILABLE_STOP,
+                    'reason': f'ncc unavailable for {unavailable_age:.1f}s',
+                }
+            return {
+                'state': self.STATE_NCC_UNAVAILABLE_WAIT,
+                'reason': f'ncc unavailable for {unavailable_age:.1f}s; holding still',
             }
 
         last_positive_age = time.time() - self._last_detection_time
@@ -770,16 +878,164 @@ class NavigationNode(Node):
     def _reset_collision_watchdog(self):
         self._collision_ref_pose = None
         self._collision_ref_time = None
+        self._odom_stale_motion_since = None
+        self._progress_ref_time = None
+        self._progress_ref_dist = None
+        self._progress_ref_area = None
+        self._edge_stuck_since = None
+        self._edge_stuck_last_dist = None
+
+    def _no_progress_detected(self, dist_m, area_ratio) -> bool:
+        if not self.navigating or self.target is None:
+            self._progress_ref_time = None
+            return False
+        if self._direct_cmd is not None:
+            self._progress_ref_time = None
+            return False
+        if abs(self._last_cmd_linear) < self.NO_PROGRESS_MIN_LINEAR_CMD:
+            self._progress_ref_time = None
+            return False
+        if dist_m is None:
+            self._progress_ref_time = None
+            return False
+
+        now = time.time()
+        if self._progress_ref_time is None:
+            self._progress_ref_time = now
+            self._progress_ref_dist = float(dist_m)
+            self._progress_ref_area = float(area_ratio)
+            return False
+
+        dist_drop = self._progress_ref_dist - float(dist_m)
+        area_gain = float(area_ratio) - self._progress_ref_area
+        if (dist_drop >= self.NO_PROGRESS_MIN_DIST_DROP_M
+                or area_gain >= self.NO_PROGRESS_MIN_AREA_GAIN):
+            self._progress_ref_time = now
+            self._progress_ref_dist = float(dist_m)
+            self._progress_ref_area = float(area_ratio)
+            return False
+
+        elapsed = now - self._progress_ref_time
+        if elapsed >= self.NO_PROGRESS_TIMEOUT_S:
+            self.get_logger().warn(
+                f'[NO_PROGRESS] elapsed={elapsed:.1f}s '
+                f'dist {self._progress_ref_dist:.2f}->{float(dist_m):.2f}m '
+                f'area {self._progress_ref_area:.2f}->{float(area_ratio):.2f} '
+                f'cmd_lin={self._last_cmd_linear:.2f}')
+            return True
+        return False
+
+    def _edge_stuck_detected(self, data, dist_m) -> bool:
+        if not self.navigating or self.target is None:
+            self._edge_stuck_since = None
+            return False
+        if self._direct_cmd is not None:
+            self._edge_stuck_since = None
+            return False
+        if abs(self._last_cmd_linear) < self.NO_PROGRESS_MIN_LINEAR_CMD:
+            self._edge_stuck_since = None
+            return False
+
+        img_w = float(data.get('image_width', self.IMAGE_WIDTH) or self.IMAGE_WIDTH)
+        cx = float(data.get('center_x', self.IMAGE_CENTER_X))
+        px_error = abs(cx - img_w * 0.5)
+        near_edge = (
+            cx <= self.EDGE_STUCK_MARGIN_PX
+            or cx >= img_w - self.EDGE_STUCK_MARGIN_PX
+        )
+        if not near_edge or px_error < self.EDGE_STUCK_MIN_ERROR_PX:
+            self._edge_stuck_since = None
+            self._edge_stuck_last_dist = None
+            return False
+
+        now = time.time()
+        if self._edge_stuck_since is None:
+            self._edge_stuck_since = now
+            self._edge_stuck_last_dist = float(dist_m) if dist_m is not None else None
+            self.get_logger().warn(
+                f'[EDGE_STUCK] watch start cx={cx:.0f}/{img_w:.0f} '
+                f'err={px_error:.0f}px dist={dist_m if dist_m is not None else "?"}')
+            return False
+
+        if dist_m is not None and self._edge_stuck_last_dist is not None:
+            dist_drop = self._edge_stuck_last_dist - float(dist_m)
+            if dist_drop >= self.NO_PROGRESS_MIN_DIST_DROP_M:
+                self._edge_stuck_since = now
+                self._edge_stuck_last_dist = float(dist_m)
+                return False
+
+        elapsed = now - self._edge_stuck_since
+        if elapsed >= self.EDGE_STUCK_TIMEOUT_S:
+            self.get_logger().warn(
+                f'[EDGE_STUCK] elapsed={elapsed:.1f}s cx={cx:.0f}/{img_w:.0f} '
+                f'err={px_error:.0f}px cmd_lin={self._last_cmd_linear:.2f}')
+            return True
+        return False
+
+    def _perception_collision_risk_detected(self, data, dist_m, area_ratio, bottom_ratio) -> bool:
+        if not self.navigating or self.target is None:
+            self._perception_risk_since = None
+            return False
+        if self._direct_cmd is not None:
+            self._perception_risk_since = None
+            return False
+        if abs(self._last_cmd_linear) < self.NO_PROGRESS_MIN_LINEAR_CMD:
+            self._perception_risk_since = None
+            return False
+
+        img_w = float(data.get('image_width', self.IMAGE_WIDTH) or self.IMAGE_WIDTH)
+        cx = float(data.get('center_x', self.IMAGE_CENTER_X))
+        px_error = abs(cx - img_w * 0.5)
+
+        edge_score = min(1.0, max(0.0, (px_error - self.CENTER_TOLERANCE) / max(1.0, img_w * 0.5 - self.CENTER_TOLERANCE)))
+        close_score = 0.0
+        if dist_m is not None:
+            close_score = min(1.0, max(0.0, (2.0 - float(dist_m)) / 1.2))
+        area_score = min(1.0, max(0.0, (float(area_ratio) - 0.03) / 0.12))
+        bottom_score = min(1.0, max(0.0, (float(bottom_ratio) - 0.70) / 0.25))
+
+        risk = (
+            0.60 * edge_score
+            + 0.20 * close_score
+            + 0.10 * area_score
+            + 0.10 * bottom_score
+        )
+
+        now = time.time()
+        if now - self._last_perception_risk_log > 1.0:
+            self._last_perception_risk_log = now
+            self.get_logger().info(
+                f'[PERCEPTION_RISK] risk={risk:.2f} edge={edge_score:.2f} '
+                f'close={close_score:.2f} area={area_score:.2f} bottom={bottom_score:.2f} '
+                f'cx={cx:.0f}/{img_w:.0f} dist={dist_m if dist_m is not None else "?"}')
+
+        if risk < self.PERCEPTION_RISK_THRESHOLD:
+            self._perception_risk_since = None
+            return False
+
+        if self._perception_risk_since is None:
+            self._perception_risk_since = now
+            return False
+
+        elapsed = now - self._perception_risk_since
+        if elapsed >= self.PERCEPTION_RISK_TIMEOUT_S:
+            self.get_logger().warn(
+                f'[PERCEPTION_RISK] high risk for {elapsed:.1f}s >= {self.PERCEPTION_RISK_TIMEOUT_S:.1f}s')
+            return True
+        return False
 
     def _publish_cmd(self, cmd: Twist):
+        self._last_cmd_linear = cmd.linear.x
+        self._last_cmd_angular = cmd.angular.z
+        self._collision_stop_reason = 'collision'
         if self._collision_detected(cmd):
             self.get_logger().warn('[COLLISION] commanded motion but odometry is stalled')
-            self.stop_robot('collision')
+            self.stop_robot(self._collision_stop_reason)
             return
         self.pub_cmd_vel.publish(cmd)
 
     def _collision_detected(self, cmd: Twist) -> bool:
-        if not self.COLLISION_DETECTION or self.current_pose is None:
+        if not self.COLLISION_DETECTION:
             return False
 
         linear_cmd = abs(cmd.linear.x)
@@ -793,6 +1049,25 @@ class NavigationNode(Node):
             return False
 
         now = time.time()
+
+        if self.current_pose is None or not self._odom_encoder_fresh:
+            self._collision_ref_pose = None
+            self._collision_ref_time = None
+            if self._odom_stale_motion_since is None:
+                self._odom_stale_motion_since = now
+                self.get_logger().warn(
+                    '[ODOM_STALE] commanded motion but encoder feedback is unavailable')
+                return False
+            stale_age = now - self._odom_stale_motion_since
+            if stale_age >= self.ODOM_STALE_MOTION_STOP_S:
+                self.get_logger().warn(
+                    f'[ODOM_STALE] no fresh encoder feedback for {stale_age:.1f}s while moving')
+                self._collision_stop_reason = 'encoder_lost'
+                return True
+            return False
+
+        self._odom_stale_motion_since = None
+
         if self._collision_ref_pose is None or self._collision_ref_time is None:
             self._collision_ref_pose = (
                 self.current_pose[0],

@@ -421,7 +421,8 @@ class PipelineNode(Node):
             s.startswith('ERROR: Target lost') or
             s.startswith('ERROR: Could not find') or
             s.startswith('ERROR: Obstacle') or
-            s.startswith('ERROR: Collision')
+            s.startswith('ERROR: Collision') or
+            s.startswith('ERROR: Encoder feedback lost')
         )
         if not self.navigating and not (ended and self._trial_metrics is not None):
             return
@@ -594,7 +595,13 @@ class PipelineNode(Node):
                         f'[DINO] found=False for "{target}"')
             except Exception as e:
                 self.get_logger().error(f'[NCC] Request failed: {e}')
-                result = {'found': False, 'target': target}
+                result = {
+                    'found': False,
+                    'target': target,
+                    'ncc_unavailable': True,
+                    'vlm_unavailable': True,
+                    'error': str(e),
+                }
         else:
             try:
                 _t0 = _time.time()
@@ -646,15 +653,20 @@ class PipelineNode(Node):
         with self._det_lock:
             self._detection = result
 
-        if result.get('found') and not self.sim_mode:
+        if (result.get('found') or result.get('ncc_unavailable')) and not self.sim_mode:
             import json
             m = String(); m.data = json.dumps(result)
             self.pub_detection.publish(m)
-            self.get_logger().info(
-                f'[PUB] /detection_result  found=True'
-                f'  score={result["score"]:.2f}'
-                f'  cx={result.get("center_x",0):.0f}'
-                f'  dist={result.get("distance_m","?")}m')
+            if result.get('ncc_unavailable'):
+                self.get_logger().warn(
+                    f'[PUB] /detection_result  ncc_unavailable=True'
+                    f'  error={result.get("error", "?")}')
+            else:
+                self.get_logger().info(
+                    f'[PUB] /detection_result  found=True'
+                    f'  score={result["score"]:.2f}'
+                    f'  cx={result.get("center_x",0):.0f}'
+                    f'  dist={result.get("distance_m","?")}m')
 
     # -------------------------------------------------------------------------
     # HSV color fallback (sim only)
