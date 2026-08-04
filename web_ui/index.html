@@ -212,6 +212,8 @@ let autoRetry = 0;
 const MAX_RETRY = 12, RETRY_MS = 3000;
 let typingRow = null;
 let lastStatusKey = '';
+let terminalStatusSeen = false;
+let lastTerminalText = '';
 
 // 鈹€鈹€ Boot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 window.addEventListener('load', () => {
@@ -342,7 +344,11 @@ function revealCanvas(canvasId, phId) {
 // 鈹€鈹€ Status 鈫?chat 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 function handleStatus(raw) {
   if (raw.startsWith('ARRIVED')) {
-    robotMsg(fmtStatus(raw));
+    const text = fmtStatus(raw);
+    if (terminalStatusSeen && lastTerminalText === text) return;
+    terminalStatusSeen = true;
+    lastTerminalText = text;
+    robotMsg(text);
     return;
   }
 
@@ -355,15 +361,27 @@ function handleStatus(raw) {
     return;
   }
   if (raw.startsWith('STOPPED')) {
+    const text = fmtStatus(raw);
+    if (terminalStatusSeen && lastTerminalText === text) return;
+    terminalStatusSeen = true;
+    lastTerminalText = text;
     dropTyping();
-    robotMsg(fmtStatus(raw));
+    robotMsg(text);
     lastStatusKey = key;
     return;
   }
   if (raw.startsWith('ERROR')) {
+    const text = fmtStatus(raw);
+    if (terminalStatusSeen && lastTerminalText === text) return;
+    terminalStatusSeen = true;
+    lastTerminalText = text;
     dropTyping();
-    robotMsg(fmtStatus(raw));
+    robotMsg(text);
     lastStatusKey = key;
+    return;
+  }
+  if (terminalStatusSeen &&
+      (raw.startsWith('PROCESSING') || raw.startsWith('NAVIGATING') || raw.startsWith('MOVING'))) {
     return;
   }
   // PROCESSING / NAVIGATING 鈥?update typing label in-place
@@ -407,6 +425,8 @@ function sendCmd() {
   if (!text || !ros || !ros.isConnected) return;
 
   lastStatusKey = '';
+  terminalStatusSeen = false;
+  lastTerminalText = '';
   userMsg(text);
   cmdPub.publish(new ROSLIB.Message({ data: text }));
   ta.value = '';

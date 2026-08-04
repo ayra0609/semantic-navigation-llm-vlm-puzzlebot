@@ -59,12 +59,16 @@ class NavigationNode(Node):
     CENTER_TOLERANCE = 80   # pixels (was 40 -- too tight for 0.5 Hz DINO)
 
     # Stop conditions
-    STOP_AREA_RATIO      = 0.35   # stop when bbox covers 35% of image
+    STOP_AREA_RATIO      = 0.40   # immediate visual stop only when bbox is very large
     STOP_AREA_MIN_SCORE  = 0.60   # area-based stop requires this confidence
-    AREA_STOP_MAX_DISTANCE = 0.80 # area stop only counts when depth also says close
-    CLOSE_RANGE_AREA     = 0.20   # target is visually close even if depth is noisy
-    BBOX_BOTTOM_STOP_RATIO = 0.92 # stop if bbox bottom is near image bottom
-    CLOSE_RANGE_DEPTH    = 1.20   # after this, target identity may become partial
+    AREA_STOP_MAX_DISTANCE = 1.20 # area stop is allowed once perception says target is close
+    CLOSE_RANGE_AREA     = 0.25   # target is visually close even if depth is noisy
+    BBOX_BOTTOM_STOP_RATIO = 0.88 # stop if bbox bottom is near image bottom
+    CLOSE_RANGE_DEPTH    = 0.80   # depth-only close range; avoid stale stops around 1 m
+    VISUAL_FINAL_AREA    = 0.25   # box cue for final calibrated crawl
+    VISUAL_FINAL_BOTTOM  = 0.70   # require the box to be low in frame before final crawl
+    VISUAL_FINAL_DEPTH   = 0.90   # depth cue must agree before final calibrated crawl
+    VISUAL_FINAL_EXTRA_M = 0.30   # after close visual lock, creep this much then stop
     USE_LIDAR            = False  # real PuzzleBot setup has no LiDAR
     LIDAR_STOP_DISTANCE  = 0.40   # unused on the real robot if no /scan data is available
     MIN_DETECTION_SCORE  = 0.25   # ignore low-confidence detections
@@ -166,6 +170,8 @@ class NavigationNode(Node):
         self._dr_last_recal_s = 0.0
         self._final_approach_locked = False
         self._final_approach_total = None
+        self._visual_final_locked = False
+        self._visual_final_stop_covered = None
         self._dist_arrived = False  # set when live depth reading reaches DIST_STOP_DISTANCE
         self._visual_arrived = False
         self._close_range_seen = False
@@ -230,6 +236,8 @@ class NavigationNode(Node):
             self._dr_last_recal_s   = 0.0
             self._final_approach_locked = False
             self._final_approach_total = None
+            self._visual_final_locked = False
+            self._visual_final_stop_covered = None
             self._dist_arrived      = False
             self._visual_arrived    = False
             self._close_range_seen  = False
@@ -263,6 +271,8 @@ class NavigationNode(Node):
         self._dr_last_recal_s   = 0.0
         self._final_approach_locked = False
         self._final_approach_total = None
+        self._visual_final_locked = False
+        self._visual_final_stop_covered = None
         self._dist_arrived      = False
         self._visual_arrived    = False
         self._close_range_seen  = False
@@ -348,12 +358,33 @@ class NavigationNode(Node):
                         f'and dist={dist_m:.2f}m <= {self.AREA_STOP_MAX_DISTANCE:.2f}m')
                     self._visual_arrived = True
                 elif (bottom_ratio >= self.BBOX_BOTTOM_STOP_RATIO
-                        and self._close_range_seen
                         and score >= self.MIN_DETECTION_SCORE):
                     self.get_logger().info(
                         f'[VISUAL_ARRIVED] bbox_bottom={bottom_ratio:.2f} '
                         f'>= {self.BBOX_BOTTOM_STOP_RATIO:.2f}')
                     self._visual_arrived = True
+
+                visual_final_cue = (
+                    bottom_ratio >= self.VISUAL_FINAL_BOTTOM
+                    and (
+                        area_ratio >= self.VISUAL_FINAL_AREA
+                        or (dist_m and dist_m <= self.VISUAL_FINAL_DEPTH)
+                    )
+                )
+                if (visual_final_cue
+                        and not self._visual_final_locked
+                        and self._dr_dist is not None
+                        and score >= self.STOP_AREA_MIN_SCORE
+                        and self.navigating):
+                    covered = self._dr_advance_s * self.LINEAR_SPEED
+                    self._visual_final_locked = True
+                    self._visual_final_stop_covered = covered + self.VISUAL_FINAL_EXTRA_M
+                    self.get_logger().info(
+                        f'[VISUAL_FINAL_LOCK] area={area_ratio:.2f}  '
+                        f'bottom={bottom_ratio:.2f}  '
+                        f'dist={dist_m if dist_m else "?"}m  '
+                        f'covered={covered:.2f}m  '
+                        f'stop_at={self._visual_final_stop_covered:.2f}m')
 
                 if self._no_progress_detected(dist_m, area_ratio):
                     self.get_logger().warn(
@@ -646,7 +677,7 @@ class NavigationNode(Node):
         if abs(error) > self.CENTER_TOLERANCE:
             cmd.linear.x  = self.LINEAR_SPEED * 0.5
             cmd.angular.z = -self.pid.compute(error * 0.5, dt)
-            if self.target_world_pos is None and self._dr_dist is not None:
+            if self._dr_dist is not None:
                 self._dr_advance_s += dt * 0.5  # half speed → half DR credit
                 dist_covered = self._dr_advance_s * self.LINEAR_SPEED
                 backup_arrival = max(0.0, self._dr_dist - self.DR_ARRIVE_MARGIN)
@@ -660,13 +691,21 @@ class NavigationNode(Node):
                         f'est={self._dr_dist:.2f}m')
                     self.stop_robot('arrived')
                     return
+                if (self._visual_final_locked
+                        and self._visual_final_stop_covered is not None
+                        and dist_covered >= self._visual_final_stop_covered):
+                    self.get_logger().info(
+                        f'[VISUAL_FINAL_ARRIVED] covered={dist_covered:.2f}m  '
+                        f'stop_at={self._visual_final_stop_covered:.2f}m')
+                    self.stop_robot('arrived')
+                    return
             self.get_logger().info(
                 f'[CMD_VEL] ALIGNING  error={error:+.0f}px  '
                 f'area={area_ratio:.2f}  lin={cmd.linear.x:.2f}  ang={cmd.angular.z:+.3f}')
 
         # Phase 2: move forward once aligned
         else:
-            if self.target_world_pos is None and self._dr_dist is not None:
+            if self._dr_dist is not None:
                 self._dr_advance_s += dt
                 dist_covered = self._dr_advance_s * self.LINEAR_SPEED
                 backup_arrival = max(0.0, self._dr_dist - self.DR_ARRIVE_MARGIN)
@@ -678,6 +717,14 @@ class NavigationNode(Node):
                     self.get_logger().info(
                         f'[DR_ARRIVED] covered={dist_covered:.2f}m  '
                         f'est={self._dr_dist:.2f}m')
+                    self.stop_robot('arrived')
+                    return
+                if (self._visual_final_locked
+                        and self._visual_final_stop_covered is not None
+                        and dist_covered >= self._visual_final_stop_covered):
+                    self.get_logger().info(
+                        f'[VISUAL_FINAL_ARRIVED] covered={dist_covered:.2f}m  '
+                        f'stop_at={self._visual_final_stop_covered:.2f}m')
                     self.stop_robot('arrived')
                     return
             cmd.linear.x  = self.LINEAR_SPEED
@@ -767,6 +814,8 @@ class NavigationNode(Node):
         self._dr_last_recal_s = 0.0
         self._final_approach_locked = False
         self._final_approach_total = None
+        self._visual_final_locked = False
+        self._visual_final_stop_covered = None
         self._dist_arrived = False
         self._visual_arrived = False
         self._close_range_seen = False
@@ -833,12 +882,6 @@ class NavigationNode(Node):
             and last_positive_age < self.DETECTION_TIMEOUT
         )
 
-        if self._close_range_seen and last_positive_age >= self.CLOSE_RANGE_LOST_STOP_S:
-            return {
-                'state': self.STATE_CLOSE_LOST,
-                'reason': 'target was close but fresh vision is stale',
-            }
-
         if (
             self.target_world_pos is not None
             and self.current_pose is not None
@@ -848,6 +891,12 @@ class NavigationNode(Node):
             return {
                 'state': self.STATE_LOCKED_MEMORY,
                 'reason': 'temporarily using remembered target position',
+            }
+
+        if self._close_range_seen and last_positive_age >= self.CLOSE_RANGE_LOST_STOP_S:
+            return {
+                'state': self.STATE_CLOSE_LOST,
+                'reason': 'target was close but fresh vision is stale',
             }
 
         if (not self._ever_detected
