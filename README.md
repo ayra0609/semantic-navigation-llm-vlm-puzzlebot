@@ -1,211 +1,210 @@
-# Semantic Navigation LLM-VLM PuzzleBot
+# Source code of LVM-Nav
 
-A semantic navigation system for PuzzleBot using LLM intent extraction (Mistral + CoT) and VLM object detection (Grounding DINO), enabling natural language commands such as "Move to the sofa" over ROS2.
+This repository contains the source code for LVM-Nav.
 
----
+The dissertation title is below.
 
-## Project Structure
-
-```
-├── llm/                    # LLM intent extraction (Mistral via Ollama)
-├── vlm/                    # VLM object detection (Grounding DINO)
-├── ros2/
-│   ├── pipeline_node.py    # PC side: LLM + VLM + visual servo
-│   └── navigation_node.py  # Jetson side: cmd_vel control
-├── tests/
-│   ├── test_intent.py      # LLM accuracy evaluation (ALFRED dataset)
-│   └── test_vlm.py         # VLM accuracy evaluation (COCO 2017)
-├── web_ui/                 # Browser-based command interface
-├── launch/                 # ROS2 launch files
-├── worlds/                 # Gazebo SDF world files
-├── test_log/               # Auto-generated test results
-├── project_log/            # Auto-generated simulation logs
-├── gazebo.sh               # One-click simulation launcher
-└── robot.sh                # One-click real robot launcher
+```text
+LVM-Nav: A Modular Language-Vision-Motion Pipeline for Semantic Navigation on a ROS2 PuzzleBot
 ```
 
----
+LVM-Nav is a semantic robot navigation system. It uses natural language commands and RGB camera images to detect target objects and estimate target distance. Finally, it sends motion commands through ROS2.
 
-## Dependencies
+Example commands are below.
+
+```text
+go to the bag
+move to the cup
+navigate to the shoe
+approach the notebook
+stop
+```
+
+## Main files
+
+`llm/intent_extraction.py`
+
+This file extracts the target object from a command.
+It uses Qwen through Ollama.
+It also has a regex fallback.
+
+`vlm/grounding_dino.py`
+
+This file runs Grounding DINO.
+It detects objects from text labels.
+
+`ros2/pipeline_node.py`
+
+This is the main PC side ROS2 node.
+It receives user commands.
+It runs language reasoning.
+It sends images to the perception system.
+It publishes target labels and detection results.
+
+`ros2/navigation_node.py`
+
+This is the Jetson side navigation node.
+It receives target labels and detection results.
+It generates `/cmd_vel`.
+
+`ros2/cmd_vel_bridge.py`
+
+This file converts `/cmd_vel` into PuzzleBot wheel commands.
+It sends wheel commands by UDP.
+It publishes odometry from wheel encoder feedback.
+
+`ncc_inference_server.py`
+
+This file runs the NCC inference server.
+It runs Grounding DINO and Depth Anything V2.
+It returns detection results and distance estimates.
+
+`web_ui/index.html`
+
+This file provides the browser interface.
+It sends commands to ROS2.
+It shows robot status and camera frames.
+
+`robot.sh`
+
+This script starts the real robot pipeline.
+
+`tests/test_intent.py`
+
+This script tests the language module with ALFRED data.
+
+`tests/test_vlm.py`
+
+This script tests the vision module with COCO data.
+
+## ROS2 topics
+
+`/llm_command`
+
+User command from the web interface.
+
+`/video_source/raw`
+
+Camera image stream.
+
+`/nav_target`
+
+Target object label.
+
+`/detection_result`
+
+Detection result.
+
+`/cmd_vel`
+
+Robot velocity command.
+
+`/odom`
+
+Odometry feedback.
+
+`/puzzlebot/status`
+
+Robot status message.
+
+## Installation
+
+The PC side used ROS2 Humble.
+The Jetson side used ROS2 Foxy.
+Python 3.10 is recommended.
+
+Install Python packages.
 
 ```bash
-# Python
-pip install transformers torch torchvision opencv-python pillow ollama requests beautifulsoup4
+pip install transformers torch torchvision opencv-python pillow ollama requests flask numpy
+```
 
-# ROS2 packages (Ubuntu / WSL2)
+Install ROS2 packages.
+
+```bash
 sudo apt install -y ros-humble-rosbridge-server ros-humble-rmw-cyclonedds-cpp
-
-# LLM model
-ollama pull mistral
 ```
 
----
-
-## 1. Run Simulation (Gazebo)
-
-Launches Gazebo, ros_gz_bridge, pipeline_node, and rosbridge in a tmux session.
+Install the language model.
 
 ```bash
-bash gazebo.sh
+ollama pull qwen2.5:0.5b
 ```
 
-**What it does:**
-- Pane 0: Gazebo + ros_gz_bridge
-- Pane 1: pipeline_node (LLM + VLM + visual servo) — log saved to `project_log/`
-- Pane 2: rosbridge (for Web UI)
-- Opens `web_ui/index.html` automatically
+ALFRED data is not included.
+COCO data is not included.
 
-**Send a command manually (without Web UI):**
-```bash
-source /opt/ros/humble/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-ros2 topic pub --once /llm_command std_msgs/String "data: 'Move to the sofa'"
-```
+## Real robot run
 
-**tmux shortcuts:**
-```
-Ctrl-B D        detach (processes keep running)
-Ctrl-B arrow    switch panes
-Ctrl-C          stop everything
-```
-
----
-
-## 2. Run Real Robot (PuzzleBot)
-
-Two-machine setup: PC runs LLM/VLM pipeline, Jetson Nano runs navigation controller.
-
-**PC side:**
-```bash
-bash robot.sh                   # default Jetson IP: 192.168.0.100
-bash robot.sh 192.168.1.50      # custom Jetson IP
-```
-
-**Jetson Nano side (run manually on Jetson):**
-```bash
-source /opt/ros/humble/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-python3 ros2/navigation_node.py
-```
-
-**Topic overview:**
-| Topic | Direction | Description |
-|-------|-----------|-------------|
-| `/llm_command` | Web UI → PC | Natural language command |
-| `/video_source/raw` | Jetson → PC | Camera stream |
-| `/nav_target` | PC → Jetson | Extracted target label |
-| `/detection_result` | PC → Jetson | Bounding box JSON |
-| `/cmd_vel` | Jetson internal | Motor commands |
-
----
-
-## 3. Test LLM (ALFRED Dataset)
-
-Evaluates Mistral + CoT intent extraction on 100 ALFRED `valid_seen` instructions.
-Pass threshold: **85% accuracy**.
-
-**Prerequisites:** Download ALFRED annotation data first (one-time, ~500 MB).
+Start the pipeline on the PC.
 
 ```bash
-# Download (one-time, ~500 MB — JSON annotations only, no images needed)
-git clone https://github.com/askforalfred/alfred.git
-cd alfred
-bash data/download_data.sh json
-# Data lands at alfred/data/json_2.1.0/
-cd ..
+bash robot.sh
 ```
 
-> Note: ignore the `torch==1.1.0` error from `requirements.txt` — do NOT run
-> `pip install -r requirements.txt`. The download script only needs bash + wget.
+Use a custom Jetson address if needed.
 
 ```bash
-# Full evaluation (requires Ollama running)
+bash robot.sh 192.168.1.50
+```
+
+Open the web interface.
+
+```text
+web_ui/index.html
+```
+
+Use this default ROS bridge address.
+
+```text
+ws://localhost:9090
+```
+
+The launcher expects a Jetson camera node at this path.
+
+```text
+ros2/camera_node.py
+```
+
+If the camera node is separate, it should publish compressed images here.
+
+```text
+/video_source/raw
+```
+
+## Evaluation
+
+Test the language module.
+
+```bash
 python3 tests/test_intent.py \
-  --alfred-path "alfred/data/json_2.1.0" \
+  --alfred-path alfred/data/json_2.1.0 \
   --split valid_seen
+```
 
-# Regex fallback only (no Ollama needed)
+Test the regex fallback.
+
+```bash
 python3 tests/test_intent.py \
-  --alfred-path "alfred/data/json_2.1.0" \
+  --alfred-path alfred/data/json_2.1.0 \
   --split valid_seen \
   --regex-only
-
-# Other splits
-python3 tests/test_intent.py \
-  --alfred-path "alfred/data/json_2.1.0" \
-  --split valid_unseen
 ```
 
-**Output:** One summary line in terminal. Full results saved to:
-```
-test_log/alfred_<split>_<YYYYMMDDHHMMSS>.log
-```
-
-**Log contains:** per-sample instruction / GT label / LLM raw JSON output / predicted label / latency.
-
----
-
-## 4. Test VLM (COCO 2017 Dataset)
-
-Evaluates Grounding DINO on 100 COCO 2017 indoor scene images.
-Pass threshold: **75% accuracy** at IoU ≥ 0.5.
-
-**Prerequisites:** Download COCO val2017 data first.
+Test the vision module.
 
 ```bash
-# Download (one-time, ~1.2 GB total)
-mkdir -p coco/images coco/annotations
-cd coco
-wget http://images.cocodataset.org/zips/val2017.zip
-unzip val2017.zip -d images/ && rm val2017.zip
-wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-unzip annotations_trainval2017.zip && rm annotations_trainval2017.zip
-cd ..
-```
-
-```bash
-# Run evaluation
-python3 tests/test_vlm.py --coco-dir coco/
-
-# Custom IoU threshold
 python3 tests/test_vlm.py --coco-dir coco/ --iou-threshold 0.5
 ```
 
-**Output:** One summary line in terminal. Full results saved to:
+Logs are written here.
+
+```text
+test_log/
 ```
-test_log/coco_val2017_<YYYYMMDDHHMMSS>.log
+
+SUMMARY OF 75 TRIALS.
+```
+puzzlebot_test_plan.xlsx
 ```
 
-**Log contains:** per-image category / found / confidence score / predicted box / best IoU / per-category accuracy breakdown.
-
-**Note:** Grounding DINO runs on CPU. 100 images takes approximately 20–30 minutes.
-
----
-
-## Evaluation Results
-
-| Module | Dataset | Metric | Result | Threshold | Status |
-|--------|---------|--------|--------|-----------|--------|
-| LLM (Mistral + CoT) | ALFRED valid_seen (100 samples) | Target label accuracy | **95.0%** | 85% | PASS |
-| VLM (Grounding DINO tiny) | COCO 2017 val2017 (100 samples) | IoU ≥ 0.5 accuracy | **82.0%** | 75% | PASS |
-
-**VLM per-category breakdown:**
-
-| Category | Correct | Total | Accuracy |
-|----------|---------|-------|----------|
-| chair | 16 | 20 | 80.0% |
-| couch | 13 | 15 | 86.7% |
-| dining table | 18 | 20 | 90.0% |
-| bed | 8 | 15 | 53.3% |
-| toilet | 8 | 10 | 80.0% |
-| tv | 10 | 10 | 100.0% |
-| sink | 4 | 5 | 80.0% |
-| refrigerator | 5 | 5 | 100.0% |
-
----
-
-## Acknowledgements
-
-- **PuzzleBot ROS2 package** — [ManchesterRoboticsLtd/puzzlebot_ros](https://github.com/ManchesterRoboticsLtd/puzzlebot_ros) (MIT License, © 2023 Manchester-Robotics). Used as the base ROS2 driver for PuzzleBot hardware control.
-- **Grounding DINO** — [IDEA-Research/GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
-- **ALFRED dataset** — [askforalfred/alfred](https://github.com/askforalfred/alfred)
